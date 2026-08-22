@@ -1,0 +1,59 @@
+import type { GeneratorSettings } from "./pcb-core";
+
+export const DEFAULT_SETTINGS: GeneratorSettings = {
+  board_thickness: 1.6,
+  trace_height: 0.5,
+  trace_width: 2.5,
+  width_mode: "auto",
+  trace_style: "vintage",
+  neckdown_width: 1.4,
+  taper_length: 4,
+  corner_radius: 3,
+  teardrop_length: 3,
+  teardrop_strength: 0.75,
+  trace_clearance: 0.5,
+  hole_compensation: 0.18,
+};
+
+export type SavedGeneratorSettings = Partial<GeneratorSettings> & {
+  min_trace_width?: number;
+  clearance?: number;
+  side?: "F.Cu" | "B.Cu";
+};
+
+export function normalizeSettings(saved?: SavedGeneratorSettings): GeneratorSettings {
+  const traceWidth = normalizedNumber(
+    saved?.trace_width ?? saved?.min_trace_width,
+    DEFAULT_SETTINGS.trace_width,
+    1.2,
+    4,
+  );
+  return {
+    board_thickness: normalizedNumber(saved?.board_thickness, DEFAULT_SETTINGS.board_thickness, 0.8, 3),
+    trace_height: normalizedNumber(saved?.trace_height, DEFAULT_SETTINGS.trace_height, 0.2, 1.4),
+    trace_width: traceWidth,
+    width_mode: saved?.width_mode === "preserve" ? "preserve" : "auto",
+    // Saved projects created before trace styling existed retain their exact
+    // straight/linear output. Fresh sessions use the new restrained preset.
+    trace_style: saved?.trace_style === "soft" || saved?.trace_style === "vintage"
+      ? saved.trace_style
+      : saved ? "technical" : DEFAULT_SETTINGS.trace_style,
+    neckdown_width: normalizedNumber(saved?.neckdown_width, DEFAULT_SETTINGS.neckdown_width, 0.8, traceWidth),
+    taper_length: normalizedNumber(saved?.taper_length, DEFAULT_SETTINGS.taper_length, 0.5, 12),
+    corner_radius: normalizedNumber(saved?.corner_radius, DEFAULT_SETTINGS.corner_radius, 0.5, 12),
+    teardrop_length: normalizedNumber(saved?.teardrop_length, DEFAULT_SETTINGS.teardrop_length, 0.5, 10),
+    teardrop_strength: normalizedNumber(saved?.teardrop_strength, DEFAULT_SETTINGS.teardrop_strength, 0, 1),
+    trace_clearance: normalizedNumber(
+      saved?.trace_clearance ?? saved?.clearance,
+      DEFAULT_SETTINGS.trace_clearance,
+      0,
+      2,
+    ),
+    hole_compensation: normalizedNumber(saved?.hole_compensation, DEFAULT_SETTINGS.hole_compensation, 0, 0.6),
+  };
+}
+
+function normalizedNumber(value: number | undefined, fallback: number, min: number, max: number) {
+  const safe = typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return Math.max(min, Math.min(max, safe));
+}
