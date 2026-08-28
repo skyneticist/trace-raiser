@@ -1,0 +1,12 @@
+[package]
+name = "kicad-layout"
+version = "0.1.0"
+edition = "2021"
+description = "Syntax-preserving KiCad PCB placement adapter for Copperline AutoLayout"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+layout-core = { path = "../layout-core" }
