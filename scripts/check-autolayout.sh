@@ -25,18 +25,25 @@ cargo run --quiet --manifest-path crates/layout-core/Cargo.toml \
 cmp "$replay_dir/first.json" "$replay_dir/second.json"
 shasum -a 256 "$replay_dir/first.json"
 
-cp public/sample-sensor.kicad_pcb "$replay_dir/sample-sensor.kicad_pcb"
-if scripts/validate-kicad-candidate.sh \
-  "$replay_dir/sample-sensor.kicad_pcb" \
-  "$replay_dir/sample-sensor.drc.json"; then
-  :
-else
-  validation_status=$?
-  if [[ $validation_status -eq 69 && "${REQUIRE_KICAD_DRC:-0}" != 1 ]]; then
-    echo "KiCad DRC skipped: set REQUIRE_KICAD_DRC=1 to require it"
+validate_kicad_fixture() {
+  local source=$1
+  local fixture_name=$2
+  local candidate="$replay_dir/$fixture_name.kicad_pcb"
+  local report="$replay_dir/$fixture_name.drc.json"
+  cp "$source" "$candidate"
+  if scripts/validate-kicad-candidate.sh "$candidate" "$report"; then
+    return 0
   else
-    exit "$validation_status"
+    local validation_status=$?
+    if [[ $validation_status -eq 69 && "${REQUIRE_KICAD_DRC:-0}" != 1 ]]; then
+      echo "KiCad DRC skipped for $fixture_name: set REQUIRE_KICAD_DRC=1 to require it"
+    else
+      return "$validation_status"
+    fi
   fi
-fi
+}
+
+validate_kicad_fixture public/sample-sensor.kicad_pcb sample-sensor
+validate_kicad_fixture crates/kicad-layout/fixtures/curved-outline.kicad_pcb curved-outline
 
 echo "AutoLayout checks passed"
