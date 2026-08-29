@@ -93,8 +93,8 @@ Every candidate release must meet all of these gates:
    complete solutions are distinguishable.
 5. The independent validator reports no overlap, outline, keepout, connectivity,
    clearance, metric, or jumper-authority defects.
-6. kicad-cli pcb drc --format json --exit-code-violations reports zero
-   violations on every emitted corpus board.
+6. kicad-cli pcb drc --format json --severity-all --exit-code-violations
+   reports zero violations on every emitted corpus board.
 7. Placement and routing are measured on a checked-in corpus, recording
    completion rate, HPWL, routed-net rate, trace length, bend count, jumper
    count, candidate evaluations, wall time, and deterministic replay hash.
@@ -111,9 +111,16 @@ route validation, bounded parsing, no-op preservation, localized placement
 patching, explicit-envelope conversion, and straight-outline assembly with Rust
 tests and Clippy warnings-as-errors.
 
-kicad-cli is not installed in the present development environment. Real KiCad
-parse/DRC evidence is therefore pending; green host tests must not be described
-as KiCad approval.
+KiCad CLI 10.0.5 has also parsed and strictly checked the routed
+public/sample-sensor.kicad_pcb fixture with all severities enabled: zero
+violations and zero unconnected items. scripts/check-autolayout.sh runs that DRC
+when KiCad is discoverable; set REQUIRE_KICAD_DRC=1 to make a missing CLI a hard
+failure. KICAD_CLI can select a non-standard executable path, and the standard
+macOS application path is discovered automatically.
+
+This is real KiCad evidence for the checked fixture, not general approval of
+future placement or routing output. Every emitted corpus candidate must still
+pass the same strict gate.
 
 ## Near-term sequence
 

@@ -24,4 +24,19 @@ cargo run --quiet --manifest-path crates/layout-core/Cargo.toml \
 
 cmp "$replay_dir/first.json" "$replay_dir/second.json"
 shasum -a 256 "$replay_dir/first.json"
+
+cp public/sample-sensor.kicad_pcb "$replay_dir/sample-sensor.kicad_pcb"
+if scripts/validate-kicad-candidate.sh \
+  "$replay_dir/sample-sensor.kicad_pcb" \
+  "$replay_dir/sample-sensor.drc.json"; then
+  :
+else
+  validation_status=$?
+  if [[ $validation_status -eq 69 && "${REQUIRE_KICAD_DRC:-0}" != 1 ]]; then
+    echo "KiCad DRC skipped: set REQUIRE_KICAD_DRC=1 to require it"
+  else
+    exit "$validation_status"
+  fi
+fi
+
 echo "AutoLayout checks passed"
