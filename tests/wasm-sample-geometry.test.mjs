@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { strFromU8, unzipSync } from "fflate";
+import { stlTo3mf } from "../app/lib/three-mf.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -54,6 +56,29 @@ function vertexKey(vertex) {
   return vertex.join(",");
 }
 
+function parse3mf(bytes) {
+  const archive = unzipSync(bytes);
+  const model = strFromU8(archive["3D/3dmodel.model"]);
+  const vertices = [...model.matchAll(/<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"\/>/g)]
+    .map((match) => match.slice(1).map(Number));
+  return [...model.matchAll(/<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"\/>/g)]
+    .map((match) => match.slice(1).map((index) => vertices[Number(index)]));
+}
+
+function assertTwoFacesPerWeldedEdge(triangles, precision = 5) {
+  const edgeCounts = new Map();
+  for (const triangle of triangles) {
+    const keys = triangle.map((vertex) => vertex.map((value) => value.toFixed(precision)).join(","));
+    for (const [a, b] of [[keys[0], keys[1]], [keys[1], keys[2]], [keys[2], keys[0]]]) {
+      const edge = a < b ? `${a}|${b}` : `${b}|${a}`;
+      edgeCounts.set(edge, (edgeCounts.get(edge) ?? 0) + 1);
+    }
+  }
+  for (const [edge, count] of edgeCounts) {
+    assert.equal(count, 2, `two welded faces at edge ${edge}`);
+  }
+}
+
 function pointInTriangle([px, py], [a, b, c]) {
   const sign = (u, v) => (px - v[0]) * (u[1] - v[1]) - (u[0] - v[0]) * (py - v[1]);
   const signs = [sign(a, b), sign(b, c), sign(c, a)];
@@ -82,17 +107,18 @@ test("shipped WASM emits a watertight sample board with every drill open", async
     width_mode: "auto",
     trace_style: "vintage",
     neckdown_width: 1.4,
-    taper_length: 4,
-    corner_radius: 3,
+    taper_length: 6,
+    corner_radius: 5,
     teardrop_length: 3,
-    teardrop_strength: 0.75,
+    teardrop_strength: 0.55,
     trace_clearance: 0.5,
     hole_compensation: 0.18,
   }));
-  const triangles = parseStl(callCore(core, "generate_stl", [
+  const stl = callCore(core, "generate_stl", [
     encoder.encode(JSON.stringify(board)),
     settings,
-  ]));
+  ]);
+  const triangles = parseStl(stl);
   const directedEdges = new Map();
   const undirectedEdges = new Map();
   const faces = new Set();
@@ -136,6 +162,11 @@ test("shipped WASM emits a watertight sample board with every drill open", async
   }
   assert.ok(signedVolume > 0, "positive signed volume");
   assert.deepEqual([...zLevels].sort((a, b) => a - b), [0, 1.6, 2.1]);
+  assertTwoFacesPerWeldedEdge(triangles);
+
+  const threeMfTriangles = parse3mf(stlTo3mf(stl, "sample-sensor"));
+  assert.equal(threeMfTriangles.length, triangles.length, "3MF preserves every STL triangle");
+  assertTwoFacesPerWeldedEdge(threeMfTriangles);
 
   const drillAxes = board.pads.filter((pad) => pad.drill).map((pad) => [
     board.bounds.max_x - pad.position.x,

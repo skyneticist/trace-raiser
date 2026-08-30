@@ -64,15 +64,15 @@ In `auto` mode, `trace_width` is the wide-trunk floor. A trace endpoint attached
 to a same-net through-hole pad remains at `neckdown_width` through the pad
 boundary, then tapers to the trunk over `taper_length`. `technical` retains the
 original linear envelope, `soft` uses quintic zero-slope easing, and `vintage`
-adds explicit monotonic tangent Bézier pad lobes plus tangent quadratic bends
-at eligible degree-2 same-circuit nodes. Pad/via nodes, branches, ambiguous nets, and corners too
-short for a safe offset remain unmodified. Two-ended short
-segments use the minimum of both endpoint envelopes and remain valid even when
-they cannot reach full trunk width. `preserve` mode emits the raw KiCad segment
-width uniformly without tapering. Old JSON without these fields receives safe
-compatibility defaults: `auto`, `technical`, 1.4 mm neck, 4.0 mm taper, 3.0 mm
-corner radius, 3.0 mm teardrop length, 0.75 teardrop strength, and 0.5 mm
-clearance.
+adds explicit monotonic tangent Bézier pad lobes plus constant-radius circular
+fillets at eligible degree-2 same-circuit nodes. Pad/via nodes, branches,
+ambiguous nets, and corners too short for a safe offset remain unmodified.
+Two-ended short segments combine both endpoint constraints without exceeding
+either envelope and remain valid even when they cannot reach full trunk width.
+`preserve` mode emits the raw KiCad segment width uniformly without tapering.
+Old JSON without these fields receives safe compatibility defaults: `auto`,
+`technical`, 1.4 mm neck, 4.0 mm taper, 3.0 mm corner radius, 3.0 mm teardrop
+length, 0.75 teardrop strength, and 0.5 mm clearance.
 
 Known nets are unioned independently before export. Same-net overlaps and
 T-junctions are legal; different-net intersection or less than
