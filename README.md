@@ -69,6 +69,8 @@ The Rust ABI and geometry contract are documented in
 ## Why a routed board is required
 
 A schematic contains connectivity, but it does not contain physical placement,
-footprint, outline, or routing geometry. Automatic schematic-to-board conversion
-would require footprint selection, placement, and autorouting; that is a later,
-separate product problem.
+footprint, outline, or routing geometry. Copperline's separate
+[AutoLayout foundation](docs/autolayout/FOUNDATION.md) now accepts a KiCad PCB
+with footprints and an outline, and provides deterministic two-stage placement.
+Footprint assignment, routing, and integration into the Studio upload flow are
+still later product stages.

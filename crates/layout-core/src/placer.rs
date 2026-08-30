@@ -13,6 +13,10 @@ use std::error::Error;
 use std::fmt;
 
 const SCORE_EPSILON: f64 = 1.0e-9;
+const GLOBAL_HINT_WEIGHT: f64 = 0.05;
+const GLOBAL_ANNEAL_STEPS_PER_COMPONENT: usize = 64;
+const GLOBAL_ANNEAL_MIN_STEPS: usize = 256;
+const GLOBAL_ANNEAL_MAX_STEPS: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesignValidationError {
@@ -385,6 +389,20 @@ pub fn place(
             options.max_grid_points,
             mix64(options.seed ^ restart as u64),
         );
+        let global_hints = if restart == 0 {
+            None
+        } else {
+            Some(global_placement_hints(
+                design,
+                &order,
+                &fixed,
+                &component_lookup,
+                &grid,
+                options,
+                restart,
+                &mut evaluations,
+            ))
+        };
         let mut placements = fixed.clone();
         for component_index in order {
             let component = &design.components[component_index];
@@ -396,6 +414,10 @@ pub fn place(
                 &grid,
                 options.seed,
                 restart,
+                global_hints
+                    .as_ref()
+                    .and_then(|hints| hints.get(&component.id))
+                    .copied(),
                 &mut evaluations,
             ) else {
                 break;
@@ -547,16 +569,10 @@ fn best_candidate(
     grid: &[Point],
     seed: u64,
     restart: usize,
+    global_hint: Option<Pose>,
     evaluations: &mut u64,
 ) -> Option<Pose> {
-    let mut rotations = component
-        .allowed_rotations_degrees
-        .iter()
-        .copied()
-        .map(normalize_rotation)
-        .collect::<Vec<_>>();
-    rotations.sort_by(f64::total_cmp);
-    rotations.dedup_by(|a, b| rotations_equivalent(*a, *b));
+    let rotations = canonical_rotations(component);
 
     let mut best: Option<(f64, u64, Pose)> = None;
     let mut seen = HashSet::new();
@@ -574,6 +590,7 @@ fn best_candidate(
             component_lookup,
             seed,
             restart,
+            global_hint,
             evaluations,
             &mut seen,
             &mut best,
@@ -591,6 +608,7 @@ fn best_candidate(
                 component_lookup,
                 seed,
                 restart,
+                global_hint,
                 evaluations,
                 &mut seen,
                 &mut best,
@@ -609,6 +627,7 @@ fn consider_candidate(
     component_lookup: &HashMap<&str, &Component>,
     seed: u64,
     restart: usize,
+    global_hint: Option<Pose>,
     evaluations: &mut u64,
     seen: &mut HashSet<(u64, u64, u64)>,
     best: &mut Option<(f64, u64, Pose)>,
@@ -626,7 +645,11 @@ fn consider_candidate(
         return;
     }
     let score =
-        objective_with_candidate(design, placements, component, candidate, component_lookup);
+        objective_with_candidate(design, placements, component, candidate, component_lookup)
+            + global_hint
+                .map(|hint| global_hint_distance(candidate, hint, design.placement_rules.grid_mm))
+                .unwrap_or(0.0)
+                * GLOBAL_HINT_WEIGHT;
     let tie = mix64(
         seed ^ (restart as u64).rotate_left(17)
             ^ stable_hash(component.id.as_bytes())
@@ -677,6 +700,7 @@ fn refine(
                 grid,
                 options.seed ^ (pass as u64).rotate_left(31),
                 restart,
+                None,
                 evaluations,
             )
             .unwrap_or(previous);
@@ -748,6 +772,245 @@ fn sampled_grid(bounds: Bounds, grid_mm: f64, limit: usize, seed: u64) -> Vec<Po
             }
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn global_placement_hints(
+    design: &Design,
+    movable_order: &[usize],
+    fixed: &BTreeMap<String, Pose>,
+    component_lookup: &HashMap<&str, &Component>,
+    grid: &[Point],
+    options: PlacementOptions,
+    restart: usize,
+    evaluations: &mut u64,
+) -> BTreeMap<String, Pose> {
+    let mut current = fixed.clone();
+    for component_index in movable_order {
+        let component = &design.components[*component_index];
+        current.insert(
+            component.id.clone(),
+            Pose {
+                x: component.initial_pose.x,
+                y: component.initial_pose.y,
+                rotation_degrees: closest_allowed_rotation(component),
+            },
+        );
+    }
+    if grid.is_empty() {
+        return current;
+    }
+
+    let bounds = polygon_bounds(&design.outline).expect("validated outline has bounds");
+    let board_scale = (bounds.max_x - bounds.min_x)
+        .hypot(bounds.max_y - bounds.min_y)
+        .max(design.placement_rules.grid_mm);
+    let violation_penalty =
+        board_scale * (design.components.len() + design.nets.len()).max(1) as f64 * 100.0;
+    let anneal_steps = movable_order
+        .len()
+        .saturating_mul(GLOBAL_ANNEAL_STEPS_PER_COMPONENT)
+        .clamp(GLOBAL_ANNEAL_MIN_STEPS, GLOBAL_ANNEAL_MAX_STEPS)
+        .min(options.max_grid_points);
+    let mut rng = DeterministicRng::new(mix64(
+        options.seed
+            ^ (restart as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ stable_hash(design.name.as_bytes()),
+    ));
+    let mut current_score =
+        global_placement_score(design, &current, component_lookup, violation_penalty);
+    *evaluations = evaluations.saturating_add(1);
+    let mut best = current.clone();
+    let mut best_score = current_score;
+
+    for step in 0..anneal_steps {
+        let candidate = propose_global_candidate(design, movable_order, grid, &current, &mut rng);
+        let candidate_score =
+            global_placement_score(design, &candidate, component_lookup, violation_penalty);
+        *evaluations = evaluations.saturating_add(1);
+
+        let cooling = 1.0 - step as f64 / anneal_steps as f64;
+        let temperature =
+            board_scale * 0.01 + (violation_penalty - board_scale * 0.01) * cooling * cooling;
+        let delta = candidate_score - current_score;
+        if delta <= SCORE_EPSILON || rng.unit_f64() < (-delta / temperature).exp() {
+            current = candidate;
+            current_score = candidate_score;
+            if current_score + SCORE_EPSILON < best_score {
+                best = current.clone();
+                best_score = current_score;
+            }
+        }
+    }
+    best
+}
+
+fn propose_global_candidate(
+    design: &Design,
+    movable_order: &[usize],
+    grid: &[Point],
+    current: &BTreeMap<String, Pose>,
+    rng: &mut DeterministicRng,
+) -> BTreeMap<String, Pose> {
+    let mut candidate = current.clone();
+    let selected_position = rng.index(movable_order.len());
+    let selected = &design.components[movable_order[selected_position]];
+    let operation = rng.next_u64() % 10;
+
+    if operation == 0 && movable_order.len() > 1 {
+        let mut other_position = rng.index(movable_order.len() - 1);
+        if other_position >= selected_position {
+            other_position += 1;
+        }
+        let other = &design.components[movable_order[other_position]];
+        let selected_pose = candidate[&selected.id];
+        let other_pose = candidate[&other.id];
+        candidate.insert(
+            selected.id.clone(),
+            Pose {
+                x: other_pose.x,
+                y: other_pose.y,
+                ..selected_pose
+            },
+        );
+        candidate.insert(
+            other.id.clone(),
+            Pose {
+                x: selected_pose.x,
+                y: selected_pose.y,
+                ..other_pose
+            },
+        );
+    } else if operation <= 2 {
+        let rotations = canonical_rotations(selected);
+        let mut pose = candidate[&selected.id];
+        pose.rotation_degrees = rotations[rng.index(rotations.len())];
+        candidate.insert(selected.id.clone(), pose);
+    } else if operation <= 6 {
+        const DIRECTIONS: [(f64, f64); 8] = [
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+        ];
+        let (dx, dy) = DIRECTIONS[rng.index(DIRECTIONS.len())];
+        let distance = (rng.index(4) + 1) as f64 * design.placement_rules.grid_mm;
+        let mut pose = candidate[&selected.id];
+        pose.x = normalized_zero(pose.x + dx * distance);
+        pose.y = normalized_zero(pose.y + dy * distance);
+        candidate.insert(selected.id.clone(), pose);
+    } else {
+        let point = grid[rng.index(grid.len())];
+        let mut pose = candidate[&selected.id];
+        pose.x = point.x;
+        pose.y = point.y;
+        candidate.insert(selected.id.clone(), pose);
+    }
+    candidate
+}
+
+fn global_placement_score(
+    design: &Design,
+    placements: &BTreeMap<String, Pose>,
+    component_lookup: &HashMap<&str, &Component>,
+    violation_penalty: f64,
+) -> f64 {
+    let mut violations = 0_u64;
+    let mut envelopes = Vec::<Vec<Point>>::with_capacity(design.components.len());
+    for component in &design.components {
+        let envelope = transformed_envelope(component.envelope, placements[&component.id]);
+        if !envelope_inside_outline(
+            &envelope,
+            &design.outline.vertices,
+            design.placement_rules.edge_clearance_mm,
+        ) {
+            violations += 1;
+        }
+        violations += design
+            .placement_keepouts
+            .iter()
+            .filter(|keepout| {
+                polygons_conflict(&envelope, &keepout.polygon.vertices, keepout.clearance_mm)
+            })
+            .count() as u64;
+        violations += envelopes
+            .iter()
+            .filter(|other| {
+                polygons_conflict(
+                    &envelope,
+                    other,
+                    design.placement_rules.component_clearance_mm,
+                )
+            })
+            .count() as u64;
+        envelopes.push(envelope);
+    }
+    objective(design, placements, false, component_lookup) + violations as f64 * violation_penalty
+}
+
+fn canonical_rotations(component: &Component) -> Vec<f64> {
+    let mut rotations = component
+        .allowed_rotations_degrees
+        .iter()
+        .copied()
+        .map(normalize_rotation)
+        .collect::<Vec<_>>();
+    rotations.sort_by(f64::total_cmp);
+    rotations.dedup_by(|a, b| rotations_equivalent(*a, *b));
+    rotations
+}
+
+fn closest_allowed_rotation(component: &Component) -> f64 {
+    canonical_rotations(component)
+        .into_iter()
+        .min_by(|first, second| {
+            rotation_distance(*first, component.initial_pose.rotation_degrees)
+                .total_cmp(&rotation_distance(
+                    *second,
+                    component.initial_pose.rotation_degrees,
+                ))
+                .then_with(|| first.total_cmp(second))
+        })
+        .expect("validated component has an allowed rotation")
+}
+
+fn global_hint_distance(candidate: Pose, hint: Pose, grid_mm: f64) -> f64 {
+    (candidate.x - hint.x).hypot(candidate.y - hint.y)
+        + rotation_distance(candidate.rotation_degrees, hint.rotation_degrees) / 90.0 * grid_mm
+}
+
+fn rotation_distance(first: f64, second: f64) -> f64 {
+    let difference = (normalize_rotation(first) - normalize_rotation(second)).abs();
+    difference.min(360.0 - difference)
+}
+
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = mix64(self.state);
+        self.state
+    }
+
+    fn index(&mut self, length: usize) -> usize {
+        debug_assert!(length > 0);
+        self.next_u64() as usize % length
+    }
+
+    fn unit_f64(&mut self) -> f64 {
+        const UNIT_DENOMINATOR: f64 = (1_u64 << 53) as f64;
+        (self.next_u64() >> 11) as f64 / UNIT_DENOMINATOR
+    }
 }
 
 fn objective_with_candidate(

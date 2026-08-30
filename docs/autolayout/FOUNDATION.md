@@ -71,21 +71,24 @@ and canonical coordinates follow KiCad's documented
 
 ## Placement path
 
-The checked-in engine is a deterministic legality-first baseline:
+The checked-in engine is a deterministic two-stage placer:
 
 - place locked parts and prove their mutual legality;
-- order movable parts by connectivity and envelope area;
-- search legal grid poses across allowed rotations;
-- minimize estimated half-perimeter wire length with a small displacement
-  penalty;
-- use deterministic seeded restarts;
-- refine complete candidates coordinate-by-coordinate;
-- retain the best complete candidate, or the best evidenced partial candidate
-  if the search budget is exhausted.
+- keep restart zero as the legality-first baseline and regression oracle;
+- on later restarts, run bounded seeded simulated annealing over grid positions,
+  legal rotations, and component-position swaps;
+- score the global state by HPWL, displacement, and explicit soft penalties for
+  outline, keepout, and component-clearance violations;
+- use the global result only as a hint for the exact grid legalizer;
+- refine every complete candidate coordinate-by-coordinate without the hint;
+- compare final candidates on the canonical HPWL/displacement objective, so a
+  weaker hinted candidate cannot displace the baseline;
+- return the best evidenced partial candidate if the search budget is exhausted.
 
-The next quality step is a two-stage global placer: simulated annealing over
-continuous/discrete poses, followed by the existing exact legalizer and local
-refinement. The baseline remains useful as a fallback and regression oracle.
+The annealing budget is derived from the existing placement search budget and
+capped at 2,048 proposals per hinted restart. One restart therefore preserves
+the original baseline behavior; two or more enable global placement without an
+options-schema change.
 
 ## Router decision
 
@@ -137,11 +140,12 @@ violations: <https://docs.kicad.org/master/en/cli/cli.html>.
 
 ## Current validation boundary
 
-The repository currently proves the canonical model, deterministic placement,
-route validation, bounded parsing, no-op preservation, localized placement
-patching, automatic courtyard conversion, KiCad 10 name-based net conversion,
-and canonical straight/arc/circle/rounded-rectangle outline assembly with Rust
-tests and Clippy warnings-as-errors.
+The repository currently proves the canonical model, deterministic two-stage
+placement with exact legalization, route validation, bounded parsing, no-op
+preservation, localized placement patching, automatic courtyard conversion,
+KiCad 10 name-based net conversion, and canonical
+straight/arc/circle/rounded-rectangle outline assembly with Rust tests and
+Clippy warnings-as-errors.
 
 The corpus evaluator produces a JSON report with placement status, HPWL,
 displacement, candidate count, elapsed time, and a stable FNV-1a replay
@@ -165,10 +169,9 @@ pass the same strict gate.
 
 ## Near-term sequence
 
-1. Implement the global-placement stage behind the existing contract.
-2. Implement a deterministic single-net A* router, then negotiated rip-up and
+1. Implement a deterministic single-net A* router, then negotiated rip-up and
    reroute.
-3. Add proposed-jumper review and immutable approval IDs.
-4. Emit tracks through a syntax-preserving KiCad patcher and gate them with
+2. Add proposed-jumper review and immutable approval IDs.
+3. Emit tracks through a syntax-preserving KiCad patcher and gate them with
    kicad-cli DRC.
-5. Add preview/compare/accept UI only after corpus gates are automated.
+4. Add preview/compare/accept UI only after corpus gates are automated.
