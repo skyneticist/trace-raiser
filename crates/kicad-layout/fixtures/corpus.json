@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "kicad10-rounded-name-nets",
+      "board": "kicad10-rounded-name-nets.kicad_pcb",
+      "expect": "complete",
+      "placement_options": {
+        "seed": 424242,
+        "restarts": 1,
+        "refinement_passes": 0,
+        "max_grid_points": 10000
+      },
+      "expected_replay_fingerprint": "fnv1a64:f6efb6f7b45c1391"
+    },
+    {
+      "id": "reject-unsupported-curve",
+      "board": "reject-unsupported-curve.kicad_pcb",
+      "expect": "parse_error",
+      "error_contains": "unsupported graphic primitive gr_curve"
+    }
+  ]
+}

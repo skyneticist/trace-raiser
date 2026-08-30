@@ -42,6 +42,19 @@ KICAD_CLI=/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli \
 scripts/check-autolayout.sh
 ```
 
+The intentionally small corpus smoke can also be run directly:
+
+```sh
+cargo run --manifest-path crates/kicad-layout/Cargo.toml \
+  --example evaluate_corpus -- \
+  crates/kicad-layout/fixtures/corpus.json report.json
+```
+
+It emits machine-readable placement metrics and checks a stable replay
+fingerprint. The checked-in corpus currently contains one representative KiCad
+10 success path and one fail-closed geometry path; additional cases are deferred
+until a concrete regression or a later test-expansion pass justifies them.
+
 This crate is currently an engine boundary, not a finished end-user command.
 The placement/router pipeline and preview/accept UI will call it after corpus
 evaluation and routing are implemented.

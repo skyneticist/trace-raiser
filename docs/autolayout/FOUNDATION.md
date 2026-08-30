@@ -143,6 +143,12 @@ patching, automatic courtyard conversion, KiCad 10 name-based net conversion,
 and canonical straight/arc/circle/rounded-rectangle outline assembly with Rust
 tests and Clippy warnings-as-errors.
 
+The corpus evaluator produces a JSON report with placement status, HPWL,
+displacement, candidate count, elapsed time, and a stable FNV-1a replay
+fingerprint. Its routine smoke corpus is deliberately limited to one modern
+KiCad 10 success case and one unsupported-geometry rejection case. More cases
+are added only for concrete regressions or during a later dedicated test pass.
+
 KiCad CLI 10.0.5 has also parsed and strictly checked both the routed
 public/sample-sensor.kicad_pcb fixture with F.CrtYd rectangles and the separate
 mixed line/arc curved-outline contract fixture, with all severities enabled:
@@ -159,12 +165,10 @@ pass the same strict gate.
 
 ## Near-term sequence
 
-1. Add a corpus manifest and JSON evaluator with golden replay hashes, including
-   representative KiCad 10 boards and geometry rejection cases.
-2. Implement the global-placement stage behind the existing contract.
-3. Implement a deterministic single-net A* router, then negotiated rip-up and
+1. Implement the global-placement stage behind the existing contract.
+2. Implement a deterministic single-net A* router, then negotiated rip-up and
    reroute.
-4. Add proposed-jumper review and immutable approval IDs.
-5. Emit tracks through a syntax-preserving KiCad patcher and gate them with
+3. Add proposed-jumper review and immutable approval IDs.
+4. Emit tracks through a syntax-preserving KiCad patcher and gate them with
    kicad-cli DRC.
-6. Add preview/compare/accept UI only after corpus gates are automated.
+5. Add preview/compare/accept UI only after corpus gates are automated.
