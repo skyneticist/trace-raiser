@@ -29,6 +29,11 @@ cargo run --quiet --manifest-path crates/layout-core/Cargo.toml \
 cmp "$replay_dir/first.json" "$replay_dir/second.json"
 shasum -a 256 "$replay_dir/first.json"
 
+cargo run --quiet --manifest-path crates/layout-core/Cargo.toml \
+  --example route_json -- \
+  crates/layout-core/fixtures/routing-smoke.json "$replay_dir/route.json" 424242
+shasum -a 256 "$replay_dir/route.json"
+
 validate_kicad_fixture() {
   local source=$1
   local fixture_name=$2

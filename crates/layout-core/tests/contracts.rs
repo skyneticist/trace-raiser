@@ -108,6 +108,7 @@ fn straight_route() -> RouteSolution {
             routed_net_count: 1,
             total_net_count: 1,
             total_trace_length_mm: 14.0,
+            bend_count: 0,
             jumper_count: 0,
         },
     }
@@ -269,6 +270,7 @@ fn route_validator_rejects_different_net_crossing() {
             routed_net_count: 2,
             total_net_count: 2,
             total_trace_length_mm: 22.0,
+            bend_count: 0,
             jumper_count: 0,
         },
     };
@@ -307,6 +309,7 @@ fn jumper_requires_explicit_design_authority() {
             routed_net_count: 1,
             total_net_count: 1,
             total_trace_length_mm: 0.0,
+            bend_count: 0,
             jumper_count: 1,
         },
     };

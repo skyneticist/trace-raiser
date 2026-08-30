@@ -71,6 +71,7 @@ The Rust ABI and geometry contract are documented in
 A schematic contains connectivity, but it does not contain physical placement,
 footprint, outline, or routing geometry. Copperline's separate
 [AutoLayout foundation](docs/autolayout/FOUNDATION.md) now accepts a KiCad PCB
-with footprints and an outline, and provides deterministic two-stage placement.
-Footprint assignment, routing, and integration into the Studio upload flow are
-still later product stages.
+with footprints and an outline, and provides deterministic placement and
+single-layer routing. Footprint assignment, syntax-preserving KiCad track
+emission, and integration into the Studio upload flow are still later product
+stages.

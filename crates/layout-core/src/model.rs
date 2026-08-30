@@ -206,6 +206,27 @@ impl Default for PlacementOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RoutingOptions {
+    pub seed: u64,
+    pub max_search_nodes: usize,
+    pub reroute_passes: usize,
+    pub bend_penalty_mm: f64,
+    pub congestion_penalty_mm: f64,
+}
+
+impl Default for RoutingOptions {
+    fn default() -> Self {
+        Self {
+            seed: 0xA5_7A_12_0E,
+            max_search_nodes: 250_000,
+            reroute_passes: 6,
+            bend_penalty_mm: 0.25,
+            congestion_penalty_mm: 2.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CopperLayer {
@@ -235,6 +256,8 @@ pub struct RouteMetrics {
     pub routed_net_count: usize,
     pub total_net_count: usize,
     pub total_trace_length_mm: f64,
+    #[serde(default)]
+    pub bend_count: usize,
     pub jumper_count: usize,
 }
 

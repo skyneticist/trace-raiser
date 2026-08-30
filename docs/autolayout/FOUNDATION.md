@@ -90,18 +90,27 @@ capped at 2,048 proposals per hinted restart. One restart therefore preserves
 the original baseline behavior; two or more enable global placement without an
 options-schema change.
 
-## Router decision
+## Routing path
 
-The product router should be native to the canonical model:
+The checked-in router is native to the canonical model:
 
-- coarse global routing and ordering;
-- grid-based A* or Lee search with 45-degree support;
-- multi-terminal nets decomposed into a deterministic Steiner approximation;
-- negotiated congestion with rip-up and reroute;
-- cost terms for length, bends, narrow channels, pad escape, and future jumper
-  proposals;
-- a final geometry pass and independent connectivity/clearance validation;
-- explicit partial status when one or more nets remain unrouted.
+- bounded eight-neighbor A* supplies orthogonal and 45-degree grid moves;
+- exact terminal escapes allow pads that do not fall on the routing grid;
+- multi-terminal nets grow a deterministic tree and may attach to projections
+  on existing same-net segments;
+- every move uses the independent validator's conservative board-edge, pad,
+  NPTH, and different-net trace-clearance geometry;
+- bend and historical-congestion costs guide the search;
+- failed nets are promoted on the next pass, all prior copper is ripped up, and
+  bounded seeded passes explore alternate orders and corridors;
+- the best candidate maximizes routed nets, then minimizes trace length and
+  bend count;
+- exhausted nets are returned explicitly in `unrouted_net_ids`, never reported
+  as routed.
+
+The router emits only canonical B.Cu segments today. Syntax-preserving KiCad
+track emission and `kicad-cli` DRC of those generated segments remain a separate
+gate below.
 
 [Freerouting](https://github.com/freerouting/freerouting) is valuable as an
 offline benchmark oracle because it has a mature DSN-to-autorouter-to-SES
@@ -141,7 +150,8 @@ violations: <https://docs.kicad.org/master/en/cli/cli.html>.
 ## Current validation boundary
 
 The repository currently proves the canonical model, deterministic two-stage
-placement with exact legalization, route validation, bounded parsing, no-op
+placement with exact legalization, deterministic A* routing with bounded
+rip-up/reroute, independent route validation, bounded parsing, no-op
 preservation, localized placement patching, automatic courtyard conversion,
 KiCad 10 name-based net conversion, and canonical
 straight/arc/circle/rounded-rectangle outline assembly with Rust tests and
@@ -152,6 +162,9 @@ displacement, candidate count, elapsed time, and a stable FNV-1a replay
 fingerprint. Its routine smoke corpus is deliberately limited to one modern
 KiCad 10 success case and one unsupported-geometry rejection case. More cases
 are added only for concrete regressions or during a later dedicated test pass.
+One separate routing smoke routes twice around an NPTH obstacle, requires
+byte-identical replay, and passes the independent connectivity and clearance
+validator. It is intentionally one case rather than a broad routing test matrix.
 
 KiCad CLI 10.0.5 has also parsed and strictly checked both the routed
 public/sample-sensor.kicad_pcb fixture with F.CrtYd rectangles and the separate
@@ -169,9 +182,7 @@ pass the same strict gate.
 
 ## Near-term sequence
 
-1. Implement a deterministic single-net A* router, then negotiated rip-up and
-   reroute.
-2. Add proposed-jumper review and immutable approval IDs.
-3. Emit tracks through a syntax-preserving KiCad patcher and gate them with
+1. Add proposed-jumper review and immutable approval IDs.
+2. Emit tracks through a syntax-preserving KiCad patcher and gate them with
    kicad-cli DRC.
-4. Add preview/compare/accept UI only after corpus gates are automated.
+3. Add preview/compare/accept UI only after corpus gates are automated.

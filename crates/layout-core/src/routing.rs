@@ -311,9 +311,11 @@ pub fn validate_route_solution(
         .map(|segment| distance(segment.start, segment.end))
         .sum::<f64>();
     let routed_count = design.nets.len().saturating_sub(derived_unrouted.len());
+    let bend_count = derived_bend_count(solution);
     if solution.metrics.routed_net_count != routed_count
         || solution.metrics.total_net_count != design.nets.len()
         || solution.metrics.jumper_count != solution.jumpers.len()
+        || solution.metrics.bend_count != bend_count
         || (solution.metrics.total_trace_length_mm - trace_length).abs() > 1.0e-6
     {
         issues
@@ -464,7 +466,7 @@ fn jumper_endpoint_attaches(
         })
 }
 
-fn segment_rectangle(start: Point, end: Point, half_width: f64) -> Vec<Point> {
+pub(crate) fn segment_rectangle(start: Point, end: Point, half_width: f64) -> Vec<Point> {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     let length = (dx * dx + dy * dy).sqrt();
@@ -499,7 +501,7 @@ fn segment_rectangle(start: Point, end: Point, half_width: f64) -> Vec<Point> {
     ]
 }
 
-fn distance(first: Point, second: Point) -> f64 {
+pub(crate) fn distance(first: Point, second: Point) -> f64 {
     ((first.x - second.x).powi(2) + (first.y - second.y).powi(2)).sqrt()
 }
 
@@ -531,7 +533,7 @@ fn segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool {
         || (cd_b.abs() <= EPSILON && point_on_segment(b, c, d))
 }
 
-fn segment_distance(a: Point, b: Point, c: Point, d: Point) -> f64 {
+pub(crate) fn segment_distance(a: Point, b: Point, c: Point, d: Point) -> f64 {
     if segments_intersect(a, b, c, d) {
         return 0.0;
     }
@@ -541,7 +543,7 @@ fn segment_distance(a: Point, b: Point, c: Point, d: Point) -> f64 {
         .min(point_segment_distance(d, a, b))
 }
 
-fn point_segment_distance(point: Point, start: Point, end: Point) -> f64 {
+pub(crate) fn point_segment_distance(point: Point, start: Point, end: Point) -> f64 {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     let length_squared = dx * dx + dy * dy;
@@ -557,6 +559,39 @@ fn point_segment_distance(point: Point, start: Point, end: Point) -> f64 {
             y: start.y + projection * dy,
         },
     )
+}
+
+pub(crate) fn derived_bend_count(solution: &RouteSolution) -> usize {
+    let mut bends = 0;
+    for first in 0..solution.segments.len() {
+        for second in (first + 1)..solution.segments.len() {
+            let a = &solution.segments[first];
+            let b = &solution.segments[second];
+            if a.net_id != b.net_id {
+                continue;
+            }
+            let shared = [a.start, a.end].into_iter().find(|endpoint| {
+                distance(*endpoint, b.start) <= EPSILON || distance(*endpoint, b.end) <= EPSILON
+            });
+            let Some(shared) = shared else {
+                continue;
+            };
+            let a_other = if distance(shared, a.start) <= EPSILON {
+                a.end
+            } else {
+                a.start
+            };
+            let b_other = if distance(shared, b.start) <= EPSILON {
+                b.end
+            } else {
+                b.start
+            };
+            if orientation(a_other, shared, b_other).abs() > EPSILON {
+                bends += 1;
+            }
+        }
+    }
+    bends
 }
 
 struct DisjointSet {

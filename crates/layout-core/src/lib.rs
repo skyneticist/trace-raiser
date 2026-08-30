@@ -7,8 +7,10 @@
 mod geometry;
 mod model;
 mod placer;
+mod router;
 mod routing;
 
 pub use model::*;
 pub use placer::{place, validate_design, DesignValidationError};
+pub use router::{route, RoutingError};
 pub use routing::{validate_route_solution, RouteValidationError};
