@@ -15,6 +15,12 @@ import {
   generateStl,
   parseKicad,
 } from "./lib/pcb-core";
+import {
+  BALANCED_AUTO_LAYOUT_OPTIONS,
+  generateAutoLayout,
+  type AutoLayoutOptions,
+  type AutoLayoutResult,
+} from "./lib/auto-layout";
 import { stlTo3mf } from "./lib/three-mf";
 import { buildTraceProfiles, traceProfilePolygons, type TraceProfile } from "./lib/manufacturing-geometry";
 import { findClearanceConflicts, type ClearanceConflict } from "./lib/printability";
@@ -34,6 +40,15 @@ import {
 type ViewMode = "angled" | "top";
 type ExportKind = "stl" | "3mf";
 type WorkspacePanel = "source" | "shape" | "check" | "export";
+type ProposalView = "original" | "proposed";
+type AutoLayoutQuality = "balanced" | "thorough";
+type RoutingProposal = {
+  sourceName: string;
+  originalSource: string;
+  originalBoard: ParsedBoard;
+  candidateBoard: ParsedBoard;
+  result: AutoLayoutResult;
+};
 type ProjectFile = {
   format: "copperline-project";
   version: 1;
@@ -45,6 +60,7 @@ type ProjectFile = {
 
 export default function CopperlineStudio() {
   const [board, setBoard] = useState<ParsedBoard | null>(null);
+  const [sourceText, setSourceText] = useState<string | null>(null);
   const [sourceName, setSourceName] = useState("sample-sensor.kicad_pcb");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [viewMode, setViewMode] = useState<ViewMode>("top");
@@ -55,20 +71,34 @@ export default function CopperlineStudio() {
   const [dragActive, setDragActive] = useState(false);
   const [showGuidance, setShowGuidance] = useState(false);
   const [showAllWarnings, setShowAllWarnings] = useState(false);
+  const [autoLayoutQuality, setAutoLayoutQuality] = useState<AutoLayoutQuality>("balanced");
+  const [autoLayoutOptions, setAutoLayoutOptions] = useState<AutoLayoutOptions>(() => ({
+    ...BALANCED_AUTO_LAYOUT_OPTIONS,
+  }));
+  const [routingProposal, setRoutingProposal] = useState<RoutingProposal | null>(null);
+  const [proposalView, setProposalView] = useState<ProposalView>("proposed");
+  const [routingRequiresDrc, setRoutingRequiresDrc] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const sourceRevisionRef = useRef(0);
 
   const loadKicadText = useCallback(async (text: string, name: string) => {
+    const revision = ++sourceRevisionRef.current;
     setBusy(true);
     setStatus(`Reading ${name}…`);
     try {
       const parsed = await parseKicad(text);
+      if (revision !== sourceRevisionRef.current) return;
       setBoard(parsed);
+      setSourceText(text);
       setSourceName(name);
+      setRoutingProposal(null);
+      setRoutingRequiresDrc(false);
       setStatus("Board reconstructed locally. Ready to export.");
     } catch (error) {
+      if (revision !== sourceRevisionRef.current) return;
       setStatus(error instanceof Error ? error.message : "That board could not be read.");
     } finally {
-      setBusy(false);
+      if (revision === sourceRevisionRef.current) setBusy(false);
     }
   }, []);
 
@@ -79,6 +109,17 @@ export default function CopperlineStudio() {
       await loadKicadText(await response.text(), "sample-sensor.kicad_pcb");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "The sample board could not be loaded.");
+    }
+  }, [loadKicadText]);
+
+  const loadAutoLayoutSample = useCallback(async () => {
+    try {
+      const response = await fetch("/sample-unrouted.kicad_pcb");
+      if (!response.ok) throw new Error("The AutoLayout sample is unavailable.");
+      await loadKicadText(await response.text(), "sample-unrouted.kicad_pcb");
+      setActivePanel("source");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "The AutoLayout sample could not be loaded.");
     }
   }, [loadKicadText]);
 
@@ -120,11 +161,15 @@ export default function CopperlineStudio() {
           if (project.format !== "copperline-project" || !project.board) {
             throw new Error("This is not a Copperline project file.");
           }
+          sourceRevisionRef.current += 1;
           setBoard(project.board);
+          setSourceText(null);
           // Any imported project is legacy-compatible. A missing settings
           // object must not opt an older project into newly generated styling.
           setSettings(normalizeSettings(project.settings ?? {}));
           setSourceName(project.source_name ?? file.name);
+          setRoutingProposal(null);
+          setRoutingRequiresDrc(false);
           setStatus("Project restored locally. Ready to export.");
         } catch (error) {
           setStatus(error instanceof Error ? error.message : "That project file is invalid.");
@@ -156,19 +201,132 @@ export default function CopperlineStudio() {
     value: GeneratorSettings[K],
   ) => setSettings((current) => ({ ...current, [key]: value }));
 
+  const updateAutoLayoutOption = <K extends keyof AutoLayoutOptions>(
+    key: K,
+    value: AutoLayoutOptions[K],
+  ) => setAutoLayoutOptions((current) => ({ ...current, [key]: value }));
+
+  const autoLayoutEngineOptions = useMemo<AutoLayoutOptions>(() => (
+    autoLayoutQuality === "thorough"
+      ? {
+          ...autoLayoutOptions,
+          placement_restarts: 16,
+          placement_refinement_passes: 4,
+          placement_max_grid_points: 200_000,
+          routing_max_search_nodes: 500_000,
+          routing_reroute_passes: 12,
+        }
+      : {
+          ...autoLayoutOptions,
+          placement_restarts: 8,
+          placement_refinement_passes: 2,
+          placement_max_grid_points: 100_000,
+          routing_max_search_nodes: 250_000,
+          routing_reroute_passes: 6,
+        }
+  ), [autoLayoutOptions, autoLayoutQuality]);
+
+  const previewBoard = routingProposal
+    ? proposalView === "original"
+      ? routingProposal.originalBoard
+      : routingProposal.candidateBoard
+    : board;
+  const hasExistingRouting = Boolean(
+    board && (
+      board.traces.length > 0
+      || board.vias.length > 0
+      || (board.zones?.length ?? 0) > 0
+    ),
+  );
+  const autoLayoutAvailable = Boolean(board && sourceText && !hasExistingRouting && !routingProposal);
+  const autoLayoutUnavailableReason = !board
+    ? "Load an unrouted KiCad board first."
+    : !sourceText
+      ? "Editable project files do not retain the original KiCad source. Re-open the .kicad_pcb file."
+      : hasExistingRouting
+        ? "This board already contains routed copper. AutoLayout never overwrites or merges existing routes."
+        : null;
+
+  const createRoutingProposal = async () => {
+    if (!board || !sourceText || !autoLayoutAvailable || busy) return;
+    const revision = sourceRevisionRef.current;
+    const originalBoard = board;
+    const originalSource = sourceText;
+    const originalName = sourceName;
+    setBusy(true);
+    setStatus("Exploring deterministic placement and B.Cu routes locally…");
+    try {
+      const result = await generateAutoLayout(originalSource, autoLayoutEngineOptions);
+      if (revision !== sourceRevisionRef.current) return;
+      const candidateBoard = await parseKicad(result.candidate_source);
+      if (revision !== sourceRevisionRef.current) return;
+      setRoutingProposal({
+        sourceName: originalName,
+        originalSource,
+        originalBoard,
+        candidateBoard,
+        result,
+      });
+      setProposalView("proposed");
+      setStatus(
+        `Proposal ready: ${result.metrics.routed_net_count}/${result.metrics.total_net_count} nets routed in ${result.metrics.segment_count} segment${result.metrics.segment_count === 1 ? "" : "s"}.`,
+      );
+    } catch (error) {
+      if (revision !== sourceRevisionRef.current) return;
+      setStatus(error instanceof Error ? error.message : "AutoLayout could not create a legal proposal.");
+    } finally {
+      if (revision === sourceRevisionRef.current) setBusy(false);
+    }
+  };
+
+  const discardRoutingProposal = () => {
+    setRoutingProposal(null);
+    setProposalView("proposed");
+    setStatus("Routing proposal discarded. The source board is unchanged.");
+  };
+
+  const acceptRoutingProposal = () => {
+    if (!routingProposal || busy) return;
+    const acceptedName = `${cleanName(routingProposal.sourceName)}-autorouted.kicad_pcb`;
+    downloadBlob(
+      new TextEncoder().encode(routingProposal.result.candidate_source),
+      acceptedName,
+      "application/x-kicad-pcb",
+    );
+    sourceRevisionRef.current += 1;
+    setBoard(routingProposal.candidateBoard);
+    setSourceText(routingProposal.result.candidate_source);
+    setSourceName(acceptedName);
+    setRoutingProposal(null);
+    setRoutingRequiresDrc(true);
+    setProposalView("proposed");
+    setActivePanel("check");
+    setStatus("Candidate accepted; download requested. Run KiCad DRC, save, then re-import it before printable export.");
+  };
+
+  const redownloadAcceptedCandidate = () => {
+    if (!routingRequiresDrc || !sourceText || busy) return;
+    downloadBlob(
+      new TextEncoder().encode(sourceText),
+      sourceName,
+      "application/x-kicad-pcb",
+    );
+    setStatus("Candidate download requested again. Run KiCad DRC, save, then re-import it before printable export.");
+  };
+
   const backTraces = useMemo(
-    () => board?.traces.filter((trace) => trace.layer === "B.Cu") ?? [],
-    [board],
+    () => previewBoard?.traces.filter((trace) => trace.layer === "B.Cu") ?? [],
+    [previewBoard],
   );
 
   const backPads = useMemo(
-    () => board?.pads.filter((pad) => includesBackCopper(pad.layers)) ?? [],
-    [board],
+    () => previewBoard?.pads.filter((pad) => includesBackCopper(pad.layers)) ?? [],
+    [previewBoard],
   );
 
   const backZones = useMemo(
-    () => board?.zones?.filter((zone) => zone.layer === "B.Cu" && zone.kind !== "keepout") ?? [],
-    [board],
+    () => previewBoard?.zones?.filter((zone) => zone.layer === "B.Cu" && zone.kind !== "keepout") ?? [],
+    [previewBoard],
   );
 
   const layerTraceCount = backTraces.length;
@@ -179,15 +337,29 @@ export default function CopperlineStudio() {
   );
 
   const clearanceConflicts = useMemo(
-    () => board ? findClearanceConflicts(board, settings) : [],
-    [board, settings],
+    () => previewBoard ? findClearanceConflicts(previewBoard, settings) : [],
+    [previewBoard, settings],
   );
 
   const printableWarnings = useMemo(() => {
-    if (!board) return [];
-    const warnings = board.warnings.filter(
+    if (!previewBoard) return [];
+    const warnings = previewBoard.warnings.filter(
       (warning) => !["UNSUPPORTED_SMD_PAD", "UNSUPPORTED_CUSTOM_PAD"].includes(warning.code),
     );
+    if (routingProposal) {
+      warnings.unshift({
+        code: "routing-proposal-pending",
+        severity: "error" as const,
+        message: "This is a review-only routing proposal. Accept it only after comparing both views; printable export remains locked.",
+      });
+    }
+    if (routingRequiresDrc) {
+      warnings.unshift({
+        code: "kicad-drc-required",
+        severity: "error" as const,
+        message: "KiCad DRC is still required. Open the downloaded candidate in KiCad, run Inspect → Design Rules Checker, save it, then re-import that checked board.",
+      });
+    }
     if (layerTraceCount === 0) {
       warnings.unshift({
         code: "empty-layer",
@@ -213,14 +385,15 @@ export default function CopperlineStudio() {
       });
     }
     return warnings;
-  }, [board, clearanceConflicts, layerTraceCount, unsupportedPadCount]);
+  }, [clearanceConflicts, layerTraceCount, previewBoard, routingProposal, routingRequiresDrc, unsupportedPadCount]);
 
-  const exportBlocked = printableWarnings.some((warning) => warning.severity === "error");
+  const exportBlocked = Boolean(routingProposal || routingRequiresDrc)
+    || printableWarnings.some((warning) => warning.severity === "error");
   const blockingErrorCount = printableWarnings.filter(
     (warning) => warning.severity === "error",
   ).length;
 
-  const displayedStatus = !busy && board && blockingErrorCount > 0
+  const displayedStatus = !busy && !routingProposal && !routingRequiresDrc && board && blockingErrorCount > 0
     ? `${blockingErrorCount} printability ${blockingErrorCount === 1 ? "error blocks" : "errors block"} export.`
     : status;
 
@@ -403,9 +576,152 @@ export default function CopperlineStudio() {
               <span>or drop .kicad_pcb here</span>
             </div>
 
-            <button type="button" className="sample-button" onClick={() => void loadSample()} disabled={busy}>
-              Reload sample board <span>→</span>
-            </button>
+            <div className="sample-actions">
+              <button type="button" className="sample-button" onClick={() => void loadSample()} disabled={busy}>
+                Reload routed sample <span>→</span>
+              </button>
+              <button type="button" className="sample-button" onClick={() => void loadAutoLayoutSample()} disabled={busy}>
+                Try unrouted AutoLayout demo <span>→</span>
+              </button>
+            </div>
+
+            <div className={`auto-layout-card ${routingProposal ? "has-proposal" : ""} ${routingRequiresDrc ? "requires-drc" : ""}`}>
+              <div className="auto-layout-heading">
+                <div>
+                  <span>AUTO-PLACE + ROUTE</span>
+                  <strong>{routingProposal ? "Review proposal" : routingRequiresDrc ? "Awaiting KiCad DRC" : "Single-layer B.Cu"}</strong>
+                </div>
+                <i>{routingProposal ? "READY" : routingRequiresDrc ? "CHECK" : "LOCAL"}</i>
+              </div>
+
+              {routingProposal ? (
+                <>
+                  <div className="proposal-compare" role="group" aria-label="Compare routing proposal">
+                    <button
+                      type="button"
+                      className={proposalView === "original" ? "active" : ""}
+                      aria-pressed={proposalView === "original"}
+                      onClick={() => setProposalView("original")}
+                    >
+                      Original
+                    </button>
+                    <button
+                      type="button"
+                      className={proposalView === "proposed" ? "active" : ""}
+                      aria-pressed={proposalView === "proposed"}
+                      onClick={() => setProposalView("proposed")}
+                    >
+                      Proposed
+                    </button>
+                  </div>
+                  <div className="proposal-metrics">
+                    <div><span>Parts moved</span><strong>{routingProposal.result.metrics.moved_component_count}</strong></div>
+                    <div><span>Nets routed</span><strong>{routingProposal.result.metrics.routed_net_count}/{routingProposal.result.metrics.total_net_count}</strong></div>
+                    <div><span>Segments</span><strong>{routingProposal.result.metrics.segment_count}</strong></div>
+                    <div><span>Trace length</span><strong>{routingProposal.result.metrics.trace_length_mm.toFixed(1)} mm</strong></div>
+                    <div><span>Bends</span><strong>{routingProposal.result.metrics.bend_count}</strong></div>
+                    <div><span>Seed</span><strong>{routingProposal.result.seed}</strong></div>
+                  </div>
+                  <p className="proposal-id" title={routingProposal.result.proposal_id}>
+                    Replay {routingProposal.result.proposal_id.slice(7, 19)}
+                  </p>
+                  <div className="drc-boundary" role="note">
+                    <strong>KiCad remains the authority.</strong>
+                    <span>Accepting downloads your design choice; it does not certify DRC.</span>
+                  </div>
+                  <div className="proposal-actions">
+                    <button type="button" className="accept-proposal" onClick={acceptRoutingProposal} disabled={busy}>
+                      Accept + download
+                    </button>
+                    <button type="button" className="discard-proposal" onClick={discardRoutingProposal} disabled={busy}>
+                      Discard
+                    </button>
+                  </div>
+                </>
+              ) : routingRequiresDrc ? (
+                <>
+                  <div className="drc-boundary" role="note">
+                    <strong>KiCad DRC is required.</strong>
+                    <span>Check and save this candidate in KiCad, then re-import it to unlock printable export.</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="run-auto-layout"
+                    onClick={redownloadAcceptedCandidate}
+                    disabled={busy || !sourceText}
+                  >
+                    Download candidate again<span>↓</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p className={`auto-layout-eligibility ${autoLayoutAvailable ? "is-ready" : ""}`}>
+                    {autoLayoutAvailable
+                      ? "Ready for a deterministic, review-first proposal."
+                      : autoLayoutUnavailableReason}
+                  </p>
+                  <div className="quality-picker" role="group" aria-label="AutoLayout search quality">
+                    <button
+                      type="button"
+                      className={autoLayoutQuality === "balanced" ? "active" : ""}
+                      aria-pressed={autoLayoutQuality === "balanced"}
+                      onClick={() => setAutoLayoutQuality("balanced")}
+                    >
+                      Balanced
+                    </button>
+                    <button
+                      type="button"
+                      className={autoLayoutQuality === "thorough" ? "active" : ""}
+                      aria-pressed={autoLayoutQuality === "thorough"}
+                      onClick={() => setAutoLayoutQuality("thorough")}
+                    >
+                      Thorough
+                    </button>
+                  </div>
+                  <details className="route-settings">
+                    <summary>Routing constraints</summary>
+                    <div className="route-setting-grid">
+                      <label>
+                        <span>Trace width <small>mm</small></span>
+                        <input type="number" min="0.1" max="20" step="0.1" value={autoLayoutOptions.trace_width_mm} onChange={(event) => updateAutoLayoutOption("trace_width_mm", Number(event.target.value))} />
+                      </label>
+                      <label>
+                        <span>Copper clearance <small>mm</small></span>
+                        <input type="number" min="0" max="20" step="0.1" value={autoLayoutOptions.trace_clearance_mm} onChange={(event) => updateAutoLayoutOption("trace_clearance_mm", Number(event.target.value))} />
+                      </label>
+                      <label>
+                        <span>Part clearance <small>mm</small></span>
+                        <input type="number" min="0" max="20" step="0.1" value={autoLayoutOptions.component_clearance_mm} onChange={(event) => updateAutoLayoutOption("component_clearance_mm", Number(event.target.value))} />
+                      </label>
+                      <label>
+                        <span>Edge clearance <small>mm</small></span>
+                        <input type="number" min="0" max="20" step="0.1" value={autoLayoutOptions.edge_clearance_mm} onChange={(event) => updateAutoLayoutOption("edge_clearance_mm", Number(event.target.value))} />
+                      </label>
+                      <label className="seed-setting">
+                        <span>Replay seed</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max={Number.MAX_SAFE_INTEGER}
+                          step="1"
+                          value={autoLayoutOptions.seed}
+                          onChange={(event) => updateAutoLayoutOption("seed", Math.max(0, Math.trunc(Number(event.target.value))))}
+                        />
+                      </label>
+                    </div>
+                  </details>
+                  <button
+                    type="button"
+                    className="run-auto-layout"
+                    onClick={() => void createRoutingProposal()}
+                    disabled={!autoLayoutAvailable || busy}
+                  >
+                    {busy ? "Working locally…" : "Create routing proposal"}<span>→</span>
+                  </button>
+                  <small className="auto-layout-limits">Front-side through-hole parts · B.Cu traces · no existing copper</small>
+                </>
+              )}
+            </div>
           </section>}
 
           {activePanel === "shape" && <section className="side-section build-section" aria-labelledby="build-heading">
@@ -575,7 +891,9 @@ export default function CopperlineStudio() {
         <section className="preview-panel">
           <div className="preview-toolbar">
             <div>
-              <span className="file-kicker">ACTIVE BOARD</span>
+              <span className="file-kicker">
+                {routingProposal ? `${proposalView === "original" ? "ORIGINAL" : "PROPOSED"} · ROUTING REVIEW` : "ACTIVE BOARD"}
+              </span>
               <strong title={sourceName}>{sourceName}</strong>
             </div>
             <div className="view-switch" role="group" aria-label="Preview angle">
@@ -584,7 +902,7 @@ export default function CopperlineStudio() {
             </div>
           </div>
 
-          <BoardCanvas board={board} settings={settings} viewMode={viewMode} conflicts={clearanceConflicts} />
+          <BoardCanvas board={previewBoard} settings={settings} viewMode={viewMode} conflicts={clearanceConflicts} />
 
           {clearanceConflicts.length > 0 && (
             <div className="conflict-legend" role="status"><span /> {clearanceConflicts.length} marked conflict {clearanceConflicts.length === 1 ? "location" : "locations"}</div>
@@ -616,15 +934,15 @@ export default function CopperlineStudio() {
           </div>
           <div className="board-measure">
             <span>BOARD SIZE</span>
-            <strong>{board ? `${board.bounds.width.toFixed(1)} × ${board.bounds.height.toFixed(1)}` : "—"}</strong>
+            <strong>{previewBoard ? `${previewBoard.bounds.width.toFixed(1)} × ${previewBoard.bounds.height.toFixed(1)}` : "—"}</strong>
             <small>millimeters</small>
           </div>
 
           <div className="stat-grid">
             <Stat label="Trace segments" value={layerTraceCount} />
             <Stat label="B.Cu pads" value={backPads.length} />
-            <Stat label="Holes" value={board?.stats.holes ?? 0} />
-            <Stat label="Vias" value={board?.stats.vias ?? 0} />
+            <Stat label="Holes" value={previewBoard?.stats.holes ?? 0} />
+            <Stat label="Vias" value={previewBoard?.stats.vias ?? 0} />
             <Stat label="B.Cu zones" value={backZones.length} />
             <Stat label="Zone fills" value={backZones.reduce((total, zone) => total + zone.polygons.length, 0)} />
           </div>
@@ -637,7 +955,7 @@ export default function CopperlineStudio() {
           </div>
 
           <div className="warning-list">
-            {!board ? (
+            {!previewBoard ? (
               <div className="empty-check">Load a board to run geometry checks.</div>
             ) : printableWarnings.length === 0 ? (
               <div className="pass-check"><span>✓</span><div><strong>Ready to form</strong><small>No known printability blockers.</small></div></div>
@@ -701,7 +1019,7 @@ export default function CopperlineStudio() {
             >
               Download STL <span>↓</span>
             </button>
-            <button type="button" className="project-export" onClick={exportProject} disabled={!board || busy}>
+            <button type="button" className="project-export" onClick={exportProject} disabled={!board || busy || Boolean(routingProposal) || routingRequiresDrc}>
               Save editable project
             </button>
           </div>
@@ -1136,8 +1454,10 @@ function downloadBlob(bytes: Uint8Array, name: string, type: string) {
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = name;
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 function cleanName(value: string) {

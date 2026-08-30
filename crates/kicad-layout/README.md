@@ -7,13 +7,16 @@ document. Its design bridge turns supported boards into the canonical
 `layout-core` model without guessing component bodies from pad extents.
 
 Accepted placement changes are written by replacing only the immediate `(at …)`
-expression of the selected top-level footprint. Unknown tokens, comments,
-formatting, UUIDs, graphics, rules, zones, and routed copper remain byte-for-byte
-unchanged. A no-op rewrite returns the original input exactly.
+expression of the selected top-level footprint. A complete route can also be
+inserted as deterministic `B.Cu` segment nodes immediately before the root
+closing parenthesis. Unknown tokens, comments, formatting, UUIDs, graphics, and
+rules remain byte-for-byte unchanged. A no-op rewrite returns the original
+input exactly, and existing copper is never overwritten or merged.
 
 This crate deliberately does not claim to be a complete KiCad serializer. It is
-a narrow, fail-closed adapter for placement experiments. KiCad remains the final
-parser and DRC authority for every generated candidate.
+a narrow, fail-closed adapter for localized placement and single-layer route
+candidates. KiCad remains the final parser and DRC authority for every generated
+candidate.
 
 Safety boundaries:
 
@@ -33,6 +36,10 @@ Safety boundaries:
 - locked footprints cannot be moved unless the caller explicitly overrides the
   lock;
 - unknown placement keys are errors rather than silently ignored requests.
+- candidate emission rejects existing copper, incomplete routes, stale design
+  geometry or connectivity, and jumper-bearing routes;
+- deterministic UUIDv8 track identifiers are derived from candidate content,
+  while legacy ordinal and KiCad 10 name-based net syntax are preserved.
 
 From the repository root, run the complete contract suite with:
 
@@ -55,6 +62,7 @@ fingerprint. The checked-in corpus currently contains one representative KiCad
 10 success path and one fail-closed geometry path; additional cases are deferred
 until a concrete regression or a later test-expansion pass justifies them.
 
-This crate is currently an engine boundary, not a finished end-user command.
-The placement/router pipeline and preview/accept UI will call it after corpus
-evaluation and routing are implemented.
+The native validation gate and the dedicated browser AutoLayout WASM module use
+this same adapter. Copperline Studio exposes it as a proposal workflow:
+original/proposed comparison, explicit accept-and-download, then mandatory
+KiCad DRC and re-import before printable export.

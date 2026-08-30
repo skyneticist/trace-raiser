@@ -47,6 +47,10 @@ test("keeps source, shaping, diagnostics, and export controls behind the workspa
 
   for (const label of [
     "Choose board",
+    "Create routing proposal",
+    "Accept + download",
+    "Download candidate again",
+    "KiCad remains the authority",
     "Back copper only",
     "Trace height",
     "Auto neck-down",
@@ -66,21 +70,24 @@ test("keeps source, shaping, diagnostics, and export controls behind the workspa
     "System chooser",
     "Save editable project",
   ]) {
-    assert.match(source, new RegExp(label));
+    assert.ok(source.includes(label), `expected workspace source to include ${label}`);
   }
 });
 
 test("ships the local geometry engine and production metadata", async () => {
-  const [wasm, social, packageJson, page, layout, sample] = await Promise.all([
+  const [wasm, autoLayoutWasm, social, packageJson, page, layout, sample, unroutedSample] = await Promise.all([
     stat(new URL("../public/pcb_core.wasm", import.meta.url)),
+    stat(new URL("../public/autolayout_core.wasm", import.meta.url)),
     stat(new URL("../public/og-v2.png", import.meta.url)),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../public/sample-sensor.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-unrouted.kicad_pcb", import.meta.url), "utf8"),
   ]);
 
   assert.ok(wasm.size > 100_000, "expected a compiled Rust/WASM engine");
+  assert.ok(autoLayoutWasm.size > 100_000, "expected a compiled AutoLayout WASM engine");
   assert.ok(social.size > 100_000, "expected a bespoke social preview card");
   assert.match(packageJson, /"name": "copperline-studio"/);
   assert.match(packageJson, /"fflate"/);
@@ -92,16 +99,32 @@ test("ships the local geometry engine and production metadata", async () => {
   assert.match(sample, /\(layer "B\.Cu"\)/);
   assert.match(sample, /thru_hole/);
   assert.doesNotMatch(sample, /\spad\s+"[^"]+"\s+smd\s/);
+  assert.match(unroutedSample, /^\(kicad_pcb/);
+  assert.doesNotMatch(unroutedSample, /\(segment\b/);
 });
 
 test("compiled WebAssembly exposes the browser loader ABI", async () => {
-  const bytes = await readFile(new URL("../public/pcb_core.wasm", import.meta.url));
-  const wasmModule = await WebAssembly.compile(bytes);
-  const instance = await WebAssembly.instantiate(wasmModule, {});
+  const [bytes, autoLayoutBytes] = await Promise.all([
+    readFile(new URL("../public/pcb_core.wasm", import.meta.url)),
+    readFile(new URL("../public/autolayout_core.wasm", import.meta.url)),
+  ]);
+  const [wasmModule, autoLayoutModule] = await Promise.all([
+    WebAssembly.compile(bytes),
+    WebAssembly.compile(autoLayoutBytes),
+  ]);
+  const [instance, autoLayoutInstance] = await Promise.all([
+    WebAssembly.instantiate(wasmModule, {}),
+    WebAssembly.instantiate(autoLayoutModule, {}),
+  ]);
 
   assert.equal(typeof instance.exports.alloc, "function");
   assert.equal(typeof instance.exports.dealloc, "function");
   assert.equal(typeof instance.exports.parse_kicad, "function");
   assert.equal(typeof instance.exports.generate_stl, "function");
   assert.ok(instance.exports.memory instanceof WebAssembly.Memory);
+  assert.equal(typeof autoLayoutInstance.exports.alloc, "function");
+  assert.equal(typeof autoLayoutInstance.exports.dealloc, "function");
+  assert.equal(typeof autoLayoutInstance.exports.auto_layout, "function");
+  assert.equal(typeof autoLayoutInstance.exports.last_error, "function");
+  assert.ok(autoLayoutInstance.exports.memory instanceof WebAssembly.Memory);
 });
