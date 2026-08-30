@@ -251,6 +251,21 @@ pub struct Jumper {
     pub approval_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ProposedJumper {
+    pub start: Point,
+    pub end: Point,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JumperProposal {
+    pub schema_version: u32,
+    pub proposal_id: String,
+    pub net_id: String,
+    pub jumpers: Vec<ProposedJumper>,
+    pub estimated_wire_length_mm: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouteMetrics {
     pub routed_net_count: usize,
@@ -270,4 +285,11 @@ pub struct RouteSolution {
     #[serde(default)]
     pub unrouted_net_ids: Vec<String>,
     pub metrics: RouteMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcceptedJumperProposal {
+    pub approval: JumperApproval,
+    pub design: Design,
+    pub route: RouteSolution,
 }

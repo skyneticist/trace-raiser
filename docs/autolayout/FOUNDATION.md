@@ -112,6 +112,34 @@ The router emits only canonical B.Cu segments today. Syntax-preserving KiCad
 track emission and `kicad-cli` DRC of those generated segments remain a separate
 gate below.
 
+## Jumper authority path
+
+Jumper review is an explicit, content-bound transaction:
+
+- `propose_jumpers` inspects each unrouted net's actual conductive components
+  and proposes a deterministic minimum-length spanning set between terminal
+  representatives;
+- a proposal contains geometry, estimated wire length, and a stable proposal
+  ID, but it grants no routing authority;
+- `accept_jumper_proposal` is the only operation that mints an approval ID and
+  returns a consistent updated design and route;
+- the SHA-256 approval ID binds an approval-independent design snapshot, exact
+  placement, net, and complete direction-independent jumper set;
+- one approval is bounded to its exact jumper count, and proposals exceeding 32
+  jumpers fail closed instead of creating an unreviewable batch;
+- the independent route validator recomputes the content identity whenever an
+  approval is used, rejecting copied IDs, changed endpoints, subsets, or added
+  jumpers.
+
+Changing unrelated approvals does not invalidate an accepted jumper, but any
+electrical-design, board/component-geometry, placement, or routing-rule change
+does. The proposal artifact is therefore reviewable before acceptance and
+tamper-evident after it.
+
+The ID is a content hash, not a signature or proof of human identity; the UI
+must invoke acceptance only from an explicit user action and retain the reviewed
+proposal for audit.
+
 [Freerouting](https://github.com/freerouting/freerouting) is valuable as an
 offline benchmark oracle because it has a mature DSN-to-autorouter-to-SES
 pipeline. It is not the embedded product engine: its GPL-3.0, Java, and
@@ -151,9 +179,10 @@ violations: <https://docs.kicad.org/master/en/cli/cli.html>.
 
 The repository currently proves the canonical model, deterministic two-stage
 placement with exact legalization, deterministic A* routing with bounded
-rip-up/reroute, independent route validation, bounded parsing, no-op
-preservation, localized placement patching, automatic courtyard conversion,
-KiCad 10 name-based net conversion, and canonical
+rip-up/reroute, content-bound jumper proposals and explicit acceptance,
+independent route validation, bounded parsing, no-op preservation, localized
+placement patching, automatic courtyard conversion, KiCad 10 name-based net
+conversion, and canonical
 straight/arc/circle/rounded-rectangle outline assembly with Rust tests and
 Clippy warnings-as-errors.
 
@@ -165,6 +194,9 @@ are added only for concrete regressions or during a later dedicated test pass.
 One separate routing smoke routes twice around an NPTH obstacle, requires
 byte-identical replay, and passes the independent connectivity and clearance
 validator. It is intentionally one case rather than a broad routing test matrix.
+The existing jumper-authority contract smoke now also covers deterministic
+proposal replay, explicit acceptance, forbidden pre-acceptance use, and
+geometry-tamper rejection; no separate jumper test matrix was added.
 
 KiCad CLI 10.0.5 has also parsed and strictly checked both the routed
 public/sample-sensor.kicad_pcb fixture with F.CrtYd rectangles and the separate
@@ -182,7 +214,6 @@ pass the same strict gate.
 
 ## Near-term sequence
 
-1. Add proposed-jumper review and immutable approval IDs.
-2. Emit tracks through a syntax-preserving KiCad patcher and gate them with
+1. Emit tracks through a syntax-preserving KiCad patcher and gate them with
    kicad-cli DRC.
-3. Add preview/compare/accept UI only after corpus gates are automated.
+2. Add preview/compare/accept UI only after corpus gates are automated.

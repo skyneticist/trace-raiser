@@ -6,7 +6,7 @@ use crate::{
     Design, JumperMode, PlacementOutcome, PlacementStatus, Point, RouteSolution,
     SOLUTION_SCHEMA_VERSION,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -203,7 +203,7 @@ pub fn validate_route_solution(
         .iter()
         .map(|approval| (approval.approval_id.as_str(), approval))
         .collect::<HashMap<_, _>>();
-    let mut jumper_counts = HashMap::<&str, usize>::new();
+    let mut jumper_groups = BTreeMap::<&str, Vec<&crate::Jumper>>::new();
     for (index, jumper) in solution.jumpers.iter().enumerate() {
         let path = format!("jumpers[{index}]");
         if !net_ids.contains(jumper.net_id.as_str()) {
@@ -250,9 +250,10 @@ pub fn validate_route_solution(
         if jumper.approval_id.trim().is_empty() {
             issues.push(format!("{path}.approval_id: must not be empty"));
         } else {
-            *jumper_counts
+            jumper_groups
                 .entry(jumper.approval_id.as_str())
-                .or_default() += 1;
+                .or_default()
+                .push(jumper);
             if design.jumper_policy.mode == JumperMode::UserApprovedOnly {
                 match approvals_by_id.get(jumper.approval_id.as_str()) {
                     Some(approval) if approval.net_id == jumper.net_id => {}
@@ -273,13 +274,28 @@ pub fn validate_route_solution(
             issues.push("jumpers: design policy forbids all jumpers".into());
         }
         JumperMode::UserApprovedOnly => {
-            for (approval_id, count) in jumper_counts {
+            for (approval_id, jumpers) in jumper_groups {
                 if let Some(approval) = approvals_by_id.get(approval_id) {
-                    if count > approval.max_count {
+                    if jumpers.len() > approval.max_count {
                         issues.push(format!(
-                            "jumpers: approval {approval_id} permits {} jumper(s), but {count} were used",
-                            approval.max_count
+                            "jumpers: approval {approval_id} permits {} jumper(s), but {} were used",
+                            approval.max_count,
+                            jumpers.len()
                         ));
+                    }
+                    match crate::jumpers::approval_id_for_jumpers(
+                        design,
+                        placement,
+                        &approval.net_id,
+                        &jumpers,
+                    ) {
+                        Ok(expected) if expected == approval_id => {}
+                        Ok(_) => issues.push(format!(
+                            "jumpers: approval {approval_id} does not match the exact accepted geometry"
+                        )),
+                        Err(error) => issues.push(format!(
+                            "jumpers: could not verify approval {approval_id}: {error}"
+                        )),
                     }
                 }
             }
@@ -329,7 +345,7 @@ pub fn validate_route_solution(
     }
 }
 
-fn derived_unrouted_nets(
+pub(crate) fn derived_unrouted_nets(
     design: &Design,
     placement: &PlacementOutcome,
     solution: &RouteSolution,

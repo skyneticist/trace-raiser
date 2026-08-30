@@ -1,8 +1,9 @@
 use layout_core::{
-    place, validate_design, validate_route_solution, Component, CopperLayer, Design, Jumper,
-    JumperApproval, JumperMode, JumperPolicy, LocalAabb, Net, Pad, PadKind, PlacementOptions,
-    PlacementRules, PlacementStatus, Point, Polygon, Pose, RouteMetrics, RouteSegment,
-    RouteSolution, RoutingRules, TerminalRef, DESIGN_SCHEMA_VERSION, SOLUTION_SCHEMA_VERSION,
+    accept_jumper_proposal, place, propose_jumpers, validate_design, validate_route_solution,
+    Component, CopperLayer, Design, JumperMode, JumperPolicy, LocalAabb, Net, Pad, PadKind,
+    PlacementOptions, PlacementRules, PlacementStatus, Point, Polygon, Pose, RouteMetrics,
+    RouteSegment, RouteSolution, RoutingRules, TerminalRef, DESIGN_SCHEMA_VERSION,
+    SOLUTION_SCHEMA_VERSION,
 };
 
 fn pad() -> Pad {
@@ -293,41 +294,54 @@ fn route_validator_checks_np_through_hole_clearance() {
 
 #[test]
 fn jumper_requires_explicit_design_authority() {
-    let mut design = two_pin_design(true);
+    let design = two_pin_design(true);
     let placement = place(&design, PlacementOptions::default()).unwrap();
-    let jumper_route = RouteSolution {
+    let partial_route = RouteSolution {
         schema_version: SOLUTION_SCHEMA_VERSION,
-        segments: Vec::new(),
-        jumpers: vec![Jumper {
+        segments: vec![RouteSegment {
             net_id: "N1".into(),
-            start: Point { x: 3.0, y: 5.0 },
+            start: Point { x: 10.0, y: 5.0 },
             end: Point { x: 17.0, y: 5.0 },
-            approval_id: "review-0001".into(),
+            width_mm: 1.0,
+            layer: CopperLayer::Back,
         }],
-        unrouted_net_ids: Vec::new(),
+        jumpers: Vec::new(),
+        unrouted_net_ids: vec!["N1".into()],
         metrics: RouteMetrics {
-            routed_net_count: 1,
+            routed_net_count: 0,
             total_net_count: 1,
-            total_trace_length_mm: 0.0,
+            total_trace_length_mm: 7.0,
             bend_count: 0,
-            jumper_count: 1,
+            jumper_count: 0,
         },
     };
-    let forbidden = validate_route_solution(&design, &placement, &jumper_route).unwrap_err();
+    validate_route_solution(&design, &placement, &partial_route).unwrap();
+
+    let proposals = propose_jumpers(&design, &placement, &partial_route).unwrap();
+    assert_eq!(
+        proposals,
+        propose_jumpers(&design, &placement, &partial_route).unwrap()
+    );
+    assert_eq!(proposals.len(), 1);
+    assert!(proposals[0].proposal_id.starts_with("jumper-proposal-v1:"));
+
+    let accepted =
+        accept_jumper_proposal(&design, &placement, &partial_route, &proposals[0]).unwrap();
+    assert!(accepted
+        .approval
+        .approval_id
+        .starts_with("jumper-approval-v1:"));
+    assert_eq!(accepted.approval.max_count, 1);
+    assert!(accepted.route.unrouted_net_ids.is_empty());
+    validate_route_solution(&accepted.design, &placement, &accepted.route).unwrap();
+
+    let forbidden = validate_route_solution(&design, &placement, &accepted.route).unwrap_err();
     assert!(forbidden.to_string().contains("forbids all jumpers"));
 
-    design.jumper_policy = JumperPolicy {
-        mode: JumperMode::UserApprovedOnly,
-        approvals: vec![JumperApproval {
-            approval_id: "review-0001".into(),
-            net_id: "N1".into(),
-            max_count: 1,
-        }],
-    };
-    let mut unapproved_route = jumper_route.clone();
-    unapproved_route.jumpers[0].approval_id = "review-not-granted".into();
-    let unapproved = validate_route_solution(&design, &placement, &unapproved_route).unwrap_err();
-    assert!(unapproved.to_string().contains("no user approval named"));
-
-    validate_route_solution(&design, &placement, &jumper_route).unwrap();
+    let mut tampered = accepted.route.clone();
+    tampered.jumpers[0].end = Point { x: 10.0, y: 5.0 };
+    let error = validate_route_solution(&accepted.design, &placement, &tampered).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match the exact accepted geometry"));
 }
