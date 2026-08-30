@@ -1,5 +1,5 @@
 import type { CopperZone, GeneratorSettings, Pad, ParsedBoard, Point, Trace, Via } from "./pcb-core";
-import { buildTraceProfiles, padPolygon, traceProfilePolygons, type TraceProfile } from "./manufacturing-geometry.ts";
+import { buildTraceProfiles, padPolygon, traceProfilePolygons } from "./manufacturing-geometry.ts";
 
 export type ClearanceConflict = {
   kind: "trace-trace" | "trace-pad" | "trace-via" | "trace-zone" | "pad-pad" | "pad-via" | "pad-zone" | "via-via" | "via-zone" | "zone-zone";
@@ -14,26 +14,21 @@ export type ClearanceConflict = {
 };
 
 type Closest = { a: Point; b: Point; ta: number; tb: number; distance: number };
+type FeatureKind = "trace" | "pad" | "via" | "zone";
+type FeatureSource = Trace | Pad | Via | CopperZone;
+type ClearanceFeature = {
+  kind: FeatureKind;
+  shapes: Point[][];
+  anchors: Point[];
+  source: FeatureSource;
+  netId: number | null;
+};
 
 export function findClearanceConflicts(
   board: ParsedBoard,
   settings: GeneratorSettings,
 ): ClearanceConflict[] {
   const profiles = buildTraceProfiles(board, settings);
-  const profilePolygons = profiles.map((profile) => traceProfilePolygons(profile));
-  const conflicts: ClearanceConflict[] = [];
-
-  for (let first = 0; first < profiles.length; first += 1) {
-    for (let second = first + 1; second < profiles.length; second += 1) {
-      if (sameProfileCircuit(profiles[first], profilePolygons[first], profiles[second], profilePolygons[second])) continue;
-      if (boundingShapeGap(profilePolygons[first], profilePolygons[second]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(profilePolygons[first], profilePolygons[second]);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) {
-        conflicts.push(conflict("trace-trace", closest, profiles[first].trace, profiles[second].trace, settings));
-      }
-    }
-  }
-
   const pads = board.pads.filter(isBackCopperPad);
   const vias = board.vias.filter(isBackCopperVia);
   const zones = (board.zones ?? []).filter((zone) => (
@@ -44,101 +39,63 @@ export function findClearanceConflicts(
   ));
   const padPolygons = pads.map((pad) => padPolygon(pad));
   const viaPolygons = vias.map((via) => circle(via.position, via.size / 2, 24));
-  for (let profileIndex = 0; profileIndex < profiles.length; profileIndex += 1) {
-    const profile = profiles[profileIndex];
-    const profilePolygon = profilePolygons[profileIndex];
-    for (let padIndex = 0; padIndex < pads.length; padIndex += 1) {
-      const pad = pads[padIndex];
-      const polygon = padPolygons[padIndex];
-      if (sameProfileFeatureCircuit(profile, profilePolygon, pad, polygon)) continue;
-      if (boundingShapeGap(profilePolygon, [polygon]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(profilePolygon, [polygon]);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) conflicts.push(conflict("trace-pad", closest, profile.trace, pad, settings));
+  const features: ClearanceFeature[] = [
+    ...profiles.map((profile): ClearanceFeature => ({
+      kind: "trace",
+      shapes: traceProfilePolygons(profile),
+      anchors: [profile.centerline[0]?.point, profile.centerline.at(-1)?.point].filter((point): point is Point => Boolean(point)),
+      source: profile.trace,
+      netId: positiveNetId(profile.trace.net_id),
+    })),
+    ...pads.map((pad, index): ClearanceFeature => ({
+      kind: "pad", shapes: [padPolygons[index]], anchors: [pad.position], source: pad,
+      netId: positiveNetId(pad.net_id),
+    })),
+    ...vias.map((via, index): ClearanceFeature => ({
+      kind: "via", shapes: [viaPolygons[index]], anchors: [via.position], source: via,
+      netId: positiveNetId(via.net_id),
+    })),
+    ...zones.map((zone): ClearanceFeature => ({
+      kind: "zone", shapes: zone.polygons, anchors: zone.polygons.flat(), source: zone,
+      netId: positiveNetId(zone.net_id),
+    })),
+  ];
+
+  // Netless legacy boards need the same transitive, authored-anchor
+  // connectivity used by the Rust exporter. Pairwise checks incorrectly split
+  // one circuit at every rounded corner, pad, or filled zone.
+  const parent = features.map((_, index) => index);
+  const root = (index: number): number => {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
     }
-    for (let viaIndex = 0; viaIndex < vias.length; viaIndex += 1) {
-      const via = vias[viaIndex];
-      const polygon = viaPolygons[viaIndex];
-      if (sameProfileFeatureCircuit(profile, profilePolygon, via, polygon)) continue;
-      if (boundingShapeGap(profilePolygon, [polygon]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(profilePolygon, [polygon]);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) conflicts.push(conflict("trace-via", closest, profile.trace, via, settings));
+    return index;
+  };
+  const union = (first: number, second: number) => {
+    const firstRoot = root(first);
+    const secondRoot = root(second);
+    if (firstRoot !== secondRoot) parent[secondRoot] = firstRoot;
+  };
+  for (let first = 0; first < features.length; first += 1) {
+    for (let second = first + 1; second < features.length; second += 1) {
+      const sameKnownNet = features[first].netId !== null && features[first].netId === features[second].netId;
+      const connectedUnknown = features[first].netId === null && features[second].netId === null
+        && featuresCoordinateConnected(features[first], features[second]);
+      if (sameKnownNet || connectedUnknown) union(first, second);
     }
   }
 
-  for (let first = 0; first < pads.length; first += 1) {
-    for (let second = first + 1; second < pads.length; second += 1) {
-      const firstPolygon = padPolygons[first];
-      const secondPolygon = padPolygons[second];
-      if (sameFeatureCircuit(pads[first], firstPolygon, pads[second], secondPolygon)) continue;
-      if (boundingGap(firstPolygon, secondPolygon) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestPolygons(firstPolygon, secondPolygon);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) conflicts.push(conflict("pad-pad", closest, pads[first], pads[second], settings));
-    }
-    for (let viaIndex = 0; viaIndex < vias.length; viaIndex += 1) {
-      const via = vias[viaIndex];
-      const padShape = padPolygons[first];
-      const viaShape = viaPolygons[viaIndex];
-      if (sameFeatureCircuit(pads[first], padShape, via, viaShape)) continue;
-      if (boundingGap(padShape, viaShape) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestPolygons(padShape, viaShape);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) conflicts.push(conflict("pad-via", closest, pads[first], via, settings));
-    }
-  }
-
-  for (let first = 0; first < vias.length; first += 1) {
-    for (let second = first + 1; second < vias.length; second += 1) {
-      const firstShape = circle(vias[first].position, vias[first].size / 2, 24);
-      const secondShape = circle(vias[second].position, vias[second].size / 2, 24);
-      if (sameFeatureCircuit(vias[first], firstShape, vias[second], secondShape)) continue;
-      const delta = distance(vias[first].position, vias[second].position);
-      const measuredGap = delta - vias[first].size / 2 - vias[second].size / 2;
-      if (violatesClearance(measuredGap, settings.trace_clearance)) {
-        const closest = {
-          a: vias[first].position,
-          b: vias[second].position,
-          ta: 0,
-          tb: 0,
-          distance: delta,
-          gap: measuredGap,
-        };
-        conflicts.push(conflict("via-via", closest, vias[first], vias[second], settings));
-      }
-    }
-  }
-
-  for (let zoneIndex = 0; zoneIndex < zones.length; zoneIndex += 1) {
-    const zone = zones[zoneIndex];
-    for (let profileIndex = 0; profileIndex < profiles.length; profileIndex += 1) {
-      const profile = profiles[profileIndex];
-      if (sameNet(zone.net_id, profile.trace.net_id)) continue;
-      if (boundingShapeGap(zone.polygons, profilePolygons[profileIndex]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(zone.polygons, profilePolygons[profileIndex]);
+  const conflicts: ClearanceConflict[] = [];
+  for (let first = 0; first < features.length; first += 1) {
+    for (let second = first + 1; second < features.length; second += 1) {
+      if (root(first) === root(second)) continue;
+      const a = features[first];
+      const b = features[second];
+      if (boundingShapeGap(a.shapes, b.shapes) > settings.trace_clearance + 1e-6) continue;
+      const closest = closestShapes(a.shapes, b.shapes);
       if (violatesClearance(closest.gap, settings.trace_clearance)) {
-        conflicts.push(conflict("trace-zone", closest, profile.trace, zone, settings));
-      }
-    }
-    for (let padIndex = 0; padIndex < pads.length; padIndex += 1) {
-      if (sameNet(zone.net_id, pads[padIndex].net_id)) continue;
-      if (boundingShapeGap(zone.polygons, [padPolygons[padIndex]]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(zone.polygons, [padPolygons[padIndex]]);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) {
-        conflicts.push(conflict("pad-zone", closest, pads[padIndex], zone, settings));
-      }
-    }
-    for (let viaIndex = 0; viaIndex < vias.length; viaIndex += 1) {
-      if (sameNet(zone.net_id, vias[viaIndex].net_id)) continue;
-      if (boundingShapeGap(zone.polygons, [viaPolygons[viaIndex]]) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(zone.polygons, [viaPolygons[viaIndex]]);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) {
-        conflicts.push(conflict("via-zone", closest, vias[viaIndex], zone, settings));
-      }
-    }
-    for (let other = zoneIndex + 1; other < zones.length; other += 1) {
-      if (sameNet(zone.net_id, zones[other].net_id)) continue;
-      if (boundingShapeGap(zone.polygons, zones[other].polygons) > settings.trace_clearance + 1e-6) continue;
-      const closest = closestShapes(zone.polygons, zones[other].polygons);
-      if (violatesClearance(closest.gap, settings.trace_clearance)) {
-        conflicts.push(conflict("zone-zone", closest, zone, zones[other], settings));
+        conflicts.push(conflict(conflictKind(a.kind, b.kind), closest, a.source, b.source, settings));
       }
     }
   }
@@ -158,8 +115,8 @@ function conflict(
     location: { x: (closest.a.x + closest.b.x) / 2, y: (closest.a.y + closest.b.y) / 2 },
     gap: closest.gap,
     requiredClearance: settings.trace_clearance,
-    firstNet: first.net_id ?? null,
-    secondNet: second.net_id ?? null,
+    firstNet: positiveNetId(first.net_id),
+    secondNet: positiveNetId(second.net_id),
     firstNetName: first.net_name ?? null,
     secondNetName: second.net_name ?? null,
   };
@@ -254,26 +211,30 @@ function isBackCopperVia(via: Via) {
   return via.layers.includes("B.Cu") || via.layers.includes("*.Cu");
 }
 
-function sameNet(a?: number | null, b?: number | null) { return a != null && a > 0 && a === b; }
 function pointInShape(point: Point, polygons: Point[][]) {
-  return polygons.some((polygon) => pointInPolygon(point, polygon));
+  return polygons.some((polygon) => pointInPolygon(point, polygon) || pointOnPolygon(point, polygon));
 }
-function sameProfileCircuit(a: TraceProfile, aPolygon: Point[][], b: TraceProfile, bPolygon: Point[][]) {
-  if (sameNet(a.trace.net_id, b.trace.net_id)) return true;
-  if (a.trace.net_id != null || b.trace.net_id != null) return false;
-  return [a.trace.start, a.trace.end].some((point) => pointInShape(point, bPolygon))
-    || [b.trace.start, b.trace.end].some((point) => pointInShape(point, aPolygon));
+function pointOnPolygon(point: Point, polygon: Point[]) {
+  return polygon.some((start, index) => pointSegmentDistance(point, start, polygon[(index + 1) % polygon.length]) <= 1e-6);
 }
-function sameProfileFeatureCircuit(profile: TraceProfile, profilePolygon: Point[][], feature: Pad | Via, featurePolygon: Point[]) {
-  if (sameNet(profile.trace.net_id, feature.net_id)) return true;
-  if (profile.trace.net_id != null || feature.net_id != null) return false;
-  return [profile.trace.start, profile.trace.end].some((point) => pointInPolygon(point, featurePolygon))
-    || pointInShape(feature.position, profilePolygon);
+function pointSegmentDistance(point: Point, start: Point, end: Point) {
+  const edge = subtract(end, start);
+  const lengthSquared = dot(edge, edge);
+  if (lengthSquared <= 1e-12) return distance(point, start);
+  const t = clamp(dot(subtract(point, start), edge) / lengthSquared, 0, 1);
+  return distance(point, { x: mix(start.x, end.x, t), y: mix(start.y, end.y, t) });
 }
-function sameFeatureCircuit(a: Pad | Via, aPolygon: Point[], b: Pad | Via, bPolygon: Point[]) {
-  if (sameNet(a.net_id, b.net_id)) return true;
-  return a.net_id == null && b.net_id == null
-    && (pointInPolygon(a.position, bPolygon) || pointInPolygon(b.position, aPolygon));
+function featuresCoordinateConnected(first: ClearanceFeature, second: ClearanceFeature) {
+  return first.anchors.some((point) => pointInShape(point, second.shapes))
+    || second.anchors.some((point) => pointInShape(point, first.shapes));
+}
+function positiveNetId(value?: number | null) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+function conflictKind(first: FeatureKind, second: FeatureKind): ClearanceConflict["kind"] {
+  const order: FeatureKind[] = ["trace", "pad", "via", "zone"];
+  const pair = order.indexOf(first) <= order.indexOf(second) ? `${first}-${second}` : `${second}-${first}`;
+  return pair as ClearanceConflict["kind"];
 }
 function violatesClearance(gap: number, required: number) {
   return gap < 1e-6 || gap + 1e-6 < required;

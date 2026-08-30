@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { normalizeParsedBoard } from "../app/lib/pcb-core.ts";
 import { findClearanceConflicts } from "../app/lib/printability.ts";
 import { DEFAULT_SETTINGS } from "../app/lib/settings.ts";
 
@@ -61,6 +62,61 @@ test("allows a coordinate-connected legacy T-junction but rejects an unanchored 
       .some((item) => item.kind === "trace-trace"),
     true,
   );
+});
+
+test("treats zero net IDs as netless and keeps a connected spoke circuit together", () => {
+  const center = { x: 10, y: 10 };
+  const spokes = Array.from({ length: 9 }, (_, index) => {
+    const angle = Math.PI * 2 * index / 9;
+    return {
+      start: center,
+      end: { x: center.x + Math.cos(angle) * 8, y: center.y + Math.sin(angle) * 8 },
+      width: 1,
+      layer: "B.Cu",
+      net_id: 0,
+      net_name: "",
+    };
+  });
+  assert.equal(findClearanceConflicts(board(spokes), DEFAULT_SETTINGS).length, 0);
+
+  const mixed = findClearanceConflicts(board([
+    { ...trace(0, 0), net_name: "" },
+    trace(0, 1),
+  ]), DEFAULT_SETTINGS);
+  assert.equal(mixed.length, 1);
+  assert.ok(mixed[0].firstNet === null || mixed[0].secondNet === null);
+});
+
+test("uses transitive connectivity through a netless filled zone", () => {
+  const first = { ...trace(1, null), width: 1, start: { x: 1, y: 1 } };
+  const second = { ...trace(2.2, null), width: 1, start: { x: 1, y: 2.2 } };
+  const zone = { layer: "B.Cu", kind: "copper", net_id: null, net_name: null, polygons: [[
+    { x: 0, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 4 }, { x: 0, y: 4 },
+  ]] };
+  assert.equal(findClearanceConflicts({ ...board([first, second]), zones: [zone] }, DEFAULT_SETTINGS).length, 0);
+});
+
+test("normalizes legacy zero and invalid net IDs before diagnostics or export", () => {
+  const raw = {
+    ...board([{ ...trace(0, 0), net_name: "" }], [{
+      position: { x: 0, y: 0 }, size: { x: 2, y: 2 }, drill: 0.8,
+      pad_type: "thru_hole", shape: "circle", rotation: 0, layers: ["*.Cu"], net_id: -2, net_name: "bad",
+    }], [{ position: { x: 5, y: 5 }, size: 1, drill: 0.4, layers: ["B.Cu"], net_id: 1.5, net_name: "bad" }]),
+    zones: [{ layer: "B.Cu", kind: "copper", net_id: 0, net_name: "", polygons: [] }],
+  };
+  const normalized = normalizeParsedBoard(raw);
+  assert.deepEqual([
+    normalized.traces[0].net_id,
+    normalized.pads[0].net_id,
+    normalized.vias[0].net_id,
+    normalized.zones[0].net_id,
+  ], [null, null, null, null]);
+  assert.deepEqual([
+    normalized.traces[0].net_name,
+    normalized.pads[0].net_name,
+    normalized.vias[0].net_name,
+    normalized.zones[0].net_name,
+  ], ["", "bad", "bad", ""]);
 });
 
 test("blocks overlap and point tangency even when requested clearance is zero", () => {

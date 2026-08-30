@@ -35,7 +35,12 @@ test("never returns undefined or out-of-range slider values", () => {
 });
 
 test("uses vintage shaping for fresh work while preserving legacy project output", () => {
-  assert.equal(normalizeSettings().trace_style, "vintage");
+  assert.deepEqual(
+    (({ trace_style, taper_length, corner_radius, teardrop_strength }) => (
+      { trace_style, taper_length, corner_radius, teardrop_strength }
+    ))(normalizeSettings()),
+    { trace_style: "vintage", taper_length: 6, corner_radius: 5, teardrop_strength: 0.55 },
+  );
   assert.equal(normalizeSettings({}).trace_style, "technical");
   assert.equal(normalizeSettings({ trace_style: "soft" }).trace_style, "soft");
   assert.equal(normalizeSettings({ trace_style: "unknown" }).trace_style, "technical");

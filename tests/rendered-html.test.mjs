@@ -24,30 +24,35 @@ test("server-renders the Copperline workspace", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>Copperline Studio — KiCad to printable PCB form<\/title>/i);
-  assert.match(html, /Workspace tools/);
-  assert.match(html, />Source</);
-  assert.match(html, />Shape</);
-  assert.match(html, />Check</);
-  assert.match(html, />Export</);
+  assert.match(html, /Source board/);
+  assert.match(html, /Build setup/);
+  assert.match(html, /Board report/);
+  assert.match(html, /Export model/);
   assert.match(html, /ACTIVE BOARD/);
   assert.match(html, /Generated board preview/);
   assert.match(html, />RELIEF</);
   assert.match(html, />TOP</);
-  assert.match(html, /Open board checks/);
+  assert.match(html, /Switch to dim theme/);
+  assert.match(html, /Vintage profile/);
   assert.match(html, /Rust · WASM/);
+  assert.doesNotMatch(html, /workspace-drawer|workflow-rail|drawer-backdrop|drawer-close|role="tab"|<details/i);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });
 
-test("keeps source, shaping, diagnostics, and export controls behind the workspace drawers", async () => {
-  const [workspaceSource, slicerSource] = await Promise.all([
+test("renders source, shaping, diagnostics, and export together on one page", async () => {
+  const [response, workspaceSource, globalStyles] = await Promise.all([
+    render(),
     readFile(new URL("../app/pcb-studio.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/lib/slicer-handoff.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
-  const source = `${workspaceSource}\n${slicerSource}`;
+  const html = await response.text();
 
   for (const label of [
     "Choose board",
-    "Back copper only",
+    "Output layer",
+    "B.Cu · mirrored · local",
+    "Form",
+    "Routing",
     "Trace height",
     "Auto neck-down",
     "Preserve KiCad",
@@ -55,8 +60,13 @@ test("keeps source, shaping, diagnostics, and export controls behind the workspa
     "Neck-down width",
     "Taper length",
     "Trace style",
-    "Vintage shaping",
+    "Vintage profile",
     "Clearance",
+    "OUTPUT RECIPE",
+    "Overall size",
+    "Vertical stack",
+    "Profile",
+    "Route widths",
     "Download 3MF",
     "Preferred slicer",
     "Bambu Studio",
@@ -65,15 +75,35 @@ test("keeps source, shaping, diagnostics, and export controls behind the workspa
     "Ultimaker Cura",
     "System chooser",
     "Save editable project",
+    "Load a board to enable model export.",
   ]) {
-    assert.match(source, new RegExp(label));
+    assert.match(html, new RegExp(label));
   }
+  assert.doesNotMatch(html, /workspace-drawer|workflow-rail|drawer-backdrop|drawer-close|<details/i);
+  assert.match(workspaceSource, /THEME_PREFERENCE_KEY = "copperline-theme"/);
+  assert.match(workspaceSource, /localStorage\.setItem\(THEME_PREFERENCE_KEY, next\)/);
+  assert.match(workspaceSource, /model-export-readiness/);
+  assert.match(workspaceSource, /validation-summary[\s\S]*displayedStatus/);
+  assert.match(workspaceSource, /Raised form preview with[\s\S]*vertical emphasis/);
+  assert.match(workspaceSource, /fillExtrudedLayers[\s\S]*drawReliefLegend/);
+  assert.match(workspaceSource, /BLOCKER/);
+  assert.doesNotMatch(workspaceSource, /header-readiness/);
+  assert.match(globalStyles, /@font-face[\s\S]*FiraCode-VF\.woff2/);
+  assert.match(globalStyles, /font-variant-ligatures: contextual common-ligatures/);
+  assert.match(globalStyles, /font-feature-settings: "calt" 1, "liga" 1/);
+  assert.match(globalStyles, /data-theme="dim"/);
+  assert.match(globalStyles, /\.controls-pane, \.output-pane[\s\S]*border-radius: 18px/);
+  assert.match(globalStyles, /\.preview-panel[\s\S]*margin: 12px 0[\s\S]*border-radius: 18px/);
+  assert.match(globalStyles, /backdrop-filter: saturate\(135%\) blur\(18px\)/);
+  assert.match(globalStyles, /--fs-meta: 11px/);
 });
 
-test("ships the local geometry engine and production metadata", async () => {
-  const [wasm, social, packageJson, page, layout, sample] = await Promise.all([
+test("ships the local geometry engine, typeface, and production metadata", async () => {
+  const [wasm, social, font, fontLicense, packageJson, page, layout, sample] = await Promise.all([
     stat(new URL("../public/pcb_core.wasm", import.meta.url)),
     stat(new URL("../public/og-v2.png", import.meta.url)),
+    stat(new URL("../public/fonts/FiraCode-VF.woff2", import.meta.url)),
+    readFile(new URL("../public/fonts/FiraCode-LICENSE.txt", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
@@ -82,12 +112,15 @@ test("ships the local geometry engine and production metadata", async () => {
 
   assert.ok(wasm.size > 100_000, "expected a compiled Rust/WASM engine");
   assert.ok(social.size > 100_000, "expected a bespoke social preview card");
+  assert.ok(font.size > 100_000, "expected the self-hosted Fira Code variable font");
+  assert.match(fontLicense, /SIL OPEN FONT LICENSE Version 1\.1/i);
   assert.match(packageJson, /"name": "copperline-studio"/);
   assert.match(packageJson, /"fflate"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.match(page, /CopperlineStudio/);
   assert.match(layout, /generateMetadata/);
   assert.match(layout, /\/og-v2\.png/);
+  assert.doesNotMatch(layout, /next\/font\/google/);
   assert.match(sample, /^\(kicad_pcb/);
   assert.match(sample, /\(layer "B\.Cu"\)/);
   assert.match(sample, /thru_hole/);

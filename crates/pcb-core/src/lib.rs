@@ -3,11 +3,13 @@
 //! The WebAssembly build deliberately uses a raw pointer/length ABI instead of
 //! `wasm-bindgen`; see `README.md` for the exact calling convention.
 
+use i_overlay::core::extract::BooleanExtractionBuffer;
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::float::overlay::FloatOverlay;
 use i_overlay::float::scale::FixedScaleFloatOverlay;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::PI;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -909,6 +911,117 @@ struct Vec3 {
     z: f32,
 }
 
+type GridPoint = [i64; 2];
+
+fn grid_point(point: &[f64; 2]) -> GridPoint {
+    [
+        (point[0] * OVERLAY_SCALE).round() as i64,
+        (point[1] * OVERLAY_SCALE).round() as i64,
+    ]
+}
+
+/// Split every partition edge at nearby endpoints from every partition member.
+/// Boolean intersections can round a shared vertex one fixed-grid unit away
+/// from its source edge, so the on-segment check admits that quantization error
+/// and keeps the rounded endpoint as a tiny kink. Earcut and the wall builder
+/// then receive identical atomic boundary segments.
+fn node_partition(parts: &[&PolyShapes]) -> Vec<PolyShapes> {
+    let mut nodes = Vec::<GridPoint>::new();
+    for contour in parts.iter().flat_map(|shapes| shapes.iter().flatten()) {
+        nodes.extend(contour.iter().map(grid_point));
+    }
+    nodes.sort();
+    nodes.dedup();
+    let mut nodes_by_x = BTreeMap::<i64, Vec<GridPoint>>::new();
+    let mut nodes_by_y = BTreeMap::<i64, Vec<GridPoint>>::new();
+    for point in nodes {
+        nodes_by_x.entry(point[0]).or_default().push(point);
+        nodes_by_y.entry(point[1]).or_default().push(point);
+    }
+
+    parts
+        .iter()
+        .map(|shapes| {
+            shapes
+                .iter()
+                .map(|shape| {
+                    shape
+                        .iter()
+                        .map(|contour| {
+                            let mut result = Vec::new();
+                            for (a, b) in contour
+                                .iter()
+                                .zip(contour.iter().cycle().skip(1))
+                                .take(contour.len())
+                            {
+                                let (a, b) = (grid_point(a), grid_point(b));
+                                if a == b {
+                                    continue;
+                                }
+                                let (dx, dy) =
+                                    (b[0] as i128 - a[0] as i128, b[1] as i128 - a[1] as i128);
+                                let length_squared = dx * dx + dy * dy;
+                                let parameter = |point: GridPoint| {
+                                    dx * point[0] as i128 + dy * point[1] as i128
+                                };
+                                let (start, end) = (parameter(a), parameter(b));
+                                let mut splits = Vec::new();
+                                let (index, low, high) = if dx.abs() >= dy.abs() {
+                                    (
+                                        &nodes_by_x,
+                                        a[0].min(b[0]).saturating_sub(1),
+                                        a[0].max(b[0]).saturating_add(1),
+                                    )
+                                } else {
+                                    (
+                                        &nodes_by_y,
+                                        a[1].min(b[1]).saturating_sub(1),
+                                        a[1].max(b[1]).saturating_add(1),
+                                    )
+                                };
+                                for candidates in index.range(low..=high).map(|(_, points)| points)
+                                {
+                                    for &point in candidates {
+                                        let (ap_x, ap_y) = (
+                                            point[0] as i128 - a[0] as i128,
+                                            point[1] as i128 - a[1] as i128,
+                                        );
+                                        let projection = dx * ap_x + dy * ap_y;
+                                        if !(0..=length_squared).contains(&projection) {
+                                            continue;
+                                        }
+                                        let cross = dx * ap_y - dy * ap_x;
+                                        // At most one 1e-5 mm grid cell away from
+                                        // the segment after independent rounding.
+                                        if cross * cross <= length_squared {
+                                            splits.push(point);
+                                        }
+                                    }
+                                }
+                                splits.sort_by_key(|point| parameter(*point));
+                                splits.dedup();
+                                if start > end {
+                                    splits.reverse();
+                                }
+                                result.extend(splits.into_iter().take_while(|point| *point != b));
+                            }
+                            result
+                                .into_iter()
+                                .map(|point| {
+                                    [
+                                        point[0] as f64 / OVERLAY_SCALE,
+                                        point[1] as f64 / OVERLAY_SCALE,
+                                    ]
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 struct Mesh {
     triangles: Vec<[Vec3; 3]>,
 }
@@ -980,31 +1093,72 @@ impl Mesh {
         }
     }
 
-    /// Emit the exterior walls of a planar partition. Shared P/R edges cancel,
-    /// while board/drill edges retain every boolean-inserted transition vertex.
-    fn vertical_partition_boundary(&mut self, parts: &[&PolyShapes], z0: f64, z1: f64) {
-        type Key = ([u64; 2], [u64; 2]);
-        let key = |p: &[f64; 2]| [p[0].to_bits(), p[1].to_bits()];
-        let mut boundary = BTreeMap::<Key, ([f64; 2], [f64; 2])>::new();
-        for contour in parts.iter().flat_map(|shapes| shapes.iter().flatten()) {
-            for (a, b) in contour
+    fn validate_closed_manifold(&self) -> Result<(), String> {
+        type VertexKey = [i64; 3];
+        let key = |vertex: Vec3| {
+            [vertex.x, vertex.y, vertex.z]
+                .map(|coordinate| (f64::from(coordinate) * OVERLAY_SCALE).round() as i64)
+        };
+        let mut directed_edges = HashMap::<(VertexKey, VertexKey), usize>::new();
+        let mut undirected_edges = HashMap::<(VertexKey, VertexKey), usize>::new();
+        let mut faces = HashSet::<[VertexKey; 3]>::new();
+        for triangle in &self.triangles {
+            if !triangle
                 .iter()
-                .zip(contour.iter().cycle().skip(1))
-                .take(contour.len())
+                .all(|vertex| vertex.x.is_finite() && vertex.y.is_finite() && vertex.z.is_finite())
             {
-                let edge = (key(a), key(b));
-                let reverse = (edge.1, edge.0);
-                if boundary.remove(&reverse).is_none() {
-                    boundary.insert(edge, (*a, *b));
-                }
+                return Err("generated mesh contains a non-finite vertex".into());
+            }
+            let keys = triangle.map(key);
+            if keys[0] == keys[1] || keys[1] == keys[2] || keys[2] == keys[0] {
+                return Err("generated mesh contains a collapsed triangle".into());
+            }
+            let ab = [
+                keys[1][0] as i128 - keys[0][0] as i128,
+                keys[1][1] as i128 - keys[0][1] as i128,
+                keys[1][2] as i128 - keys[0][2] as i128,
+            ];
+            let ac = [
+                keys[2][0] as i128 - keys[0][0] as i128,
+                keys[2][1] as i128 - keys[0][1] as i128,
+                keys[2][2] as i128 - keys[0][2] as i128,
+            ];
+            let cross = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            if cross == [0, 0, 0] {
+                return Err("generated mesh contains a degenerate triangle".into());
+            }
+            let mut face = keys;
+            face.sort();
+            if !faces.insert(face) {
+                return Err("generated mesh contains a duplicate triangle".into());
+            }
+            for (a, b) in [(keys[0], keys[1]), (keys[1], keys[2]), (keys[2], keys[0])] {
+                *directed_edges.entry((a, b)).or_default() += 1;
+                let edge = if a <= b { (a, b) } else { (b, a) };
+                *undirected_edges.entry(edge).or_default() += 1;
             }
         }
-        for (_, (a, b)) in boundary {
-            let a = Point { x: a[0], y: a[1] };
-            let b = Point { x: b[0], y: b[1] };
-            self.triangle(v3(a, z0), v3(b, z0), v3(b, z1));
-            self.triangle(v3(a, z0), v3(b, z1), v3(a, z1));
+        for ((a, b), count) in undirected_edges {
+            let forward = directed_edges.get(&(a, b)).copied().unwrap_or(0);
+            let reverse = directed_edges.get(&(b, a)).copied().unwrap_or(0);
+            if count != 2 || forward != 1 || reverse != 1 {
+                let coordinate = |value: i64| value as f64 / OVERLAY_SCALE;
+                return Err(format!(
+                    "generated mesh is not closed and consistently oriented at 1e-5 mm precision near edge ({:.5}, {:.5}, {:.5}) to ({:.5}, {:.5}, {:.5}); {count} incident faces ({forward} forward, {reverse} reverse)",
+                    coordinate(a[0]),
+                    coordinate(a[1]),
+                    coordinate(a[2]),
+                    coordinate(b[0]),
+                    coordinate(b[1]),
+                    coordinate(b[2]),
+                ));
+            }
         }
+        Ok(())
     }
 
     fn binary_stl(&self) -> Vec<u8> {
@@ -1190,6 +1344,13 @@ fn smootherstep(value: f64) -> f64 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
+fn smootherstep_derivative(value: f64) -> f64 {
+    if !(0.0..1.0).contains(&value) {
+        return 0.0;
+    }
+    30.0 * value * value * (value - 1.0) * (value - 1.0)
+}
+
 fn width_envelope(
     distance: f64,
     exit: f64,
@@ -1224,6 +1385,100 @@ struct VariableTraceProfile<'a> {
     teardrop_length: f64,
     start_shoulder: Option<f64>,
     end_shoulder: Option<f64>,
+}
+
+fn variable_trace_width_and_slope(
+    length: f64,
+    profile: VariableTraceProfile<'_>,
+    distance: f64,
+) -> (f64, f64) {
+    let side_width = |travelled: f64, exit: f64, shoulder: Option<f64>| {
+        if profile.style == "vintage" {
+            if let Some(shoulder) = shoulder {
+                let after_exit = (travelled - exit).max(0.0);
+                if after_exit <= profile.teardrop_length {
+                    let progress = after_exit / profile.teardrop_length.max(1e-9);
+                    return (
+                        shoulder + (profile.neck - shoulder) * smootherstep(progress),
+                        (profile.neck - shoulder) * smootherstep_derivative(progress)
+                            / profile.teardrop_length.max(1e-9),
+                    );
+                }
+                let progress = ((after_exit - profile.teardrop_length) / profile.taper.max(1e-9))
+                    .clamp(0.0, 1.0);
+                return (
+                    profile.neck + (profile.trunk - profile.neck) * smootherstep(progress),
+                    (profile.trunk - profile.neck) * smootherstep_derivative(progress)
+                        / profile.taper.max(1e-9),
+                );
+            }
+        }
+        let progress = ((travelled - exit) / profile.taper.max(1e-9)).clamp(0.0, 1.0);
+        let smooth = profile.style != "technical";
+        (
+            width_envelope(
+                travelled,
+                exit,
+                profile.taper,
+                profile.neck,
+                profile.trunk,
+                smooth,
+            ),
+            if progress > 0.0 && progress < 1.0 {
+                (profile.trunk - profile.neck)
+                    * if smooth {
+                        smootherstep_derivative(progress)
+                    } else {
+                        1.0
+                    }
+                    / profile.taper.max(1e-9)
+            } else {
+                0.0
+            },
+        )
+    };
+    let candidates = [
+        profile
+            .start_exit
+            .map(|exit| side_width(distance, exit, profile.start_shoulder)),
+        profile.end_exit.map(|exit| {
+            let (width, slope) = side_width(length - distance, exit, profile.end_shoulder);
+            (width, -slope)
+        }),
+    ];
+    let width_range = profile.trunk - profile.neck;
+    if profile.style != "technical"
+        && profile.start_exit.is_some()
+        && profile.end_exit.is_some()
+        && width_range > 1e-9
+    {
+        let permission = candidates.map(|candidate| {
+            candidate.map(|(width, _)| ((width - profile.neck) / width_range).clamp(0.0, 1.0))
+        });
+        let first_permission = permission[0].unwrap_or(1.0);
+        let second_permission = permission[1].unwrap_or(1.0);
+        let first_slope = candidates[0].map(|(_, slope)| slope).unwrap_or(0.0);
+        let second_slope = candidates[1].map(|(_, slope)| slope).unwrap_or(0.0);
+        return (
+            profile.neck + width_range * first_permission * second_permission,
+            first_slope * second_permission + second_slope * first_permission,
+        );
+    }
+    let mut selected = (profile.trunk, 0.0);
+    for candidate in candidates.into_iter().flatten() {
+        let selected_change = (selected.0 - profile.trunk).abs();
+        let candidate_change = (candidate.0 - profile.trunk).abs();
+        if candidate_change > selected_change + 1e-9
+            || ((candidate_change - selected_change).abs() <= 1e-9 && candidate.0 < selected.0)
+        {
+            selected = candidate;
+        }
+    }
+    selected
+}
+
+fn variable_trace_width(length: f64, profile: VariableTraceProfile<'_>, distance: f64) -> f64 {
+    variable_trace_width_and_slope(length, profile, distance).0
 }
 
 fn variable_trace_polygon(
@@ -1277,39 +1532,6 @@ fn variable_trace_polygon(
     }
     positions.sort_by(f64::total_cmp);
     positions.dedup_by(|a, b| (*a - *b).abs() < 1e-8);
-    let side_width = |travelled: f64, exit: f64, shoulder: Option<f64>| {
-        if style == "vintage" {
-            if let Some(shoulder) = shoulder {
-                let after_exit = (travelled - exit).max(0.0);
-                if after_exit <= teardrop_length {
-                    let progress = after_exit / teardrop_length.max(1e-9);
-                    return shoulder + (neck - shoulder) * smootherstep(progress);
-                }
-                let progress = ((after_exit - teardrop_length) / taper.max(1e-9)).clamp(0.0, 1.0);
-                return neck + (trunk - neck) * smootherstep(progress);
-            }
-        }
-        width_envelope(travelled, exit, taper, neck, trunk, style != "technical")
-    };
-    let allowed = |s: f64| {
-        let mut selected = trunk;
-        for candidate in [
-            start_exit.map(|exit| side_width(s, exit, start_shoulder)),
-            end_exit.map(|exit| side_width(length - s, exit, end_shoulder)),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let selected_change = (selected - trunk).abs();
-            let candidate_change = (candidate - trunk).abs();
-            if candidate_change > selected_change + 1e-9
-                || ((candidate_change - selected_change).abs() <= 1e-9 && candidate < selected)
-            {
-                selected = candidate;
-            }
-        }
-        selected
-    };
     // The min of two linear envelopes can switch inside a source interval.
     let mut crossings = Vec::new();
     if style == "technical" {
@@ -1326,6 +1548,17 @@ fn variable_trace_polygon(
                 }
             }
         }
+    } else if let (Some(se), Some(ee)) = (start_exit, end_exit) {
+        let intersection = (length - ee + se) * 0.5;
+        let start_ramp_end = se + taper;
+        let end_ramp_start = length - ee - taper;
+        if intersection >= se - 1e-9
+            && intersection <= start_ramp_end + 1e-9
+            && intersection >= end_ramp_start - 1e-9
+            && intersection <= length - ee + 1e-9
+        {
+            crossings.push(intersection.clamp(0.0, length));
+        }
     }
     positions.extend(crossings);
     positions.sort_by(f64::total_cmp);
@@ -1338,7 +1571,7 @@ fn variable_trace_polygon(
                     x: start.x + direction.x * s,
                     y: start.y + direction.y * s,
                 },
-                allowed(s),
+                variable_trace_width(length, profile, s),
             )
         })
         .collect();
@@ -1571,29 +1804,40 @@ fn canonicalize_shapes(shapes: &mut PolyShapes) {
             }
         }
     }
-    for contour in shapes.iter_mut().flatten() {
-        loop {
-            if contour.len() <= 3 {
-                break;
-            }
-            let mut remove = None;
-            for i in 0..contour.len() {
-                let a = contour[(i + contour.len() - 1) % contour.len()];
-                let b = contour[i];
-                let c = contour[(i + 1) % contour.len()];
-                let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
-                if (a == b) || (b == c) || cross.abs() < 1e-10 {
-                    remove = Some(i);
+    for shape in shapes.iter_mut() {
+        for contour in shape.iter_mut() {
+            loop {
+                if contour.len() < 3 {
+                    break;
+                }
+                let mut remove = None;
+                for i in 0..contour.len() {
+                    let a = contour[(i + contour.len() - 1) % contour.len()];
+                    let b = contour[i];
+                    let c = contour[(i + 1) % contour.len()];
+                    let ab = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                    let bc = ((c[0] - b[0]).powi(2) + (c[1] - b[1]).powi(2)).sqrt();
+                    let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+                    let rounding_area = (ab + bc) * (0.5 / OVERLAY_SCALE);
+                    if (a == b) || (b == c) || cross.abs() <= rounding_area {
+                        remove = Some(i);
+                        break;
+                    }
+                }
+                if let Some(index) = remove {
+                    contour.remove(index);
+                } else {
                     break;
                 }
             }
-            if let Some(index) = remove {
-                contour.remove(index);
-            } else {
-                break;
-            }
+        }
+        if shape.first().is_none_or(|outer| outer.len() < 3) {
+            shape.clear();
+        } else {
+            shape.retain(|contour| contour.len() >= 3);
         }
     }
+    shapes.retain(|shape| !shape.is_empty());
 }
 
 fn boolean_shapes(
@@ -1606,6 +1850,34 @@ fn boolean_shapes(
         .map_err(|error| format!("polygon boolean operation failed: {error:?}"))?;
     canonicalize_shapes(&mut result);
     Ok(result)
+}
+
+/// Extract Q, Q-R, and Q∩R from one overlay graph so every partition member
+/// shares the exact same fixed-grid intersection vertices.
+fn partition_shapes(
+    board_region: &PolyShapes,
+    copper_region: &PolyShapes,
+) -> Result<(PolyShapes, PolyShapes, PolyShapes), String> {
+    if copper_region.is_empty() {
+        return Ok((board_region.clone(), board_region.clone(), Vec::new()));
+    }
+    let mut overlay = FloatOverlay::<[f64; 2], i64>::from_subj_and_clip_fixed_scale(
+        board_region,
+        copper_region,
+        OVERLAY_SCALE,
+    )
+    .map_err(|error| format!("polygon partition operation failed: {error:?}"))?;
+    let graph = overlay
+        .build_graph_view(FillRule::NonZero)
+        .ok_or("polygon partition operation produced no graph")?;
+    let mut buffer = BooleanExtractionBuffer::<i64>::default();
+    let mut board = graph.extract_shapes(OverlayRule::Subject, &mut buffer);
+    let mut plain = graph.extract_shapes(OverlayRule::Difference, &mut buffer);
+    let mut copper = graph.extract_shapes(OverlayRule::Intersect, &mut buffer);
+    canonicalize_shapes(&mut board);
+    canonicalize_shapes(&mut plain);
+    canonicalize_shapes(&mut copper);
+    Ok((board, plain, copper))
 }
 
 fn reject_point_tangencies(shapes: &PolyShapes) -> Result<(), String> {
@@ -1662,10 +1934,11 @@ fn matching_pad_attachment(
             mapped.position = map_point(pad.position, board);
             mapped.rotation = -pad.rotation;
             let polygon = pad_polygon(&mapped);
-            let known_match =
-                trace.net_id.filter(|id| *id > 0).is_some() && trace.net_id == pad.net_id;
-            let legacy_center = trace.net_id.is_none()
-                && pad.net_id.is_none()
+            let trace_net = positive_net_id(trace.net_id);
+            let pad_net = positive_net_id(pad.net_id);
+            let known_match = trace_net.is_some() && trace_net == pad_net;
+            let legacy_center = trace_net.is_none()
+                && pad_net.is_none()
                 && distance(endpoint, mapped.position) < 1e-5;
             if !(known_match && point_in_polygon(endpoint, &polygon) || legacy_center) {
                 return None;
@@ -1851,7 +2124,7 @@ fn trace_polygon_with_trim(
         .then(|| matching_pad_attachment(board, trace, source_end, reverse))
         .flatten();
     let (start_lobe_length, end_lobe_length) = effective_teardrop_lengths(
-        source_length,
+        (source_length - start_trim - end_trim).max(0.0),
         start_attachment.as_ref(),
         end_attachment.as_ref(),
         settings,
@@ -1903,14 +2176,16 @@ fn trace_teardrop_polygons_with_trim(
         x: -direction.x,
         y: -direction.y,
     };
-    let start_attachment = (trim.start <= 1e-9)
+    let start_trim = trim.start.clamp(0.0, trace_length * 0.45);
+    let end_trim = trim.end.clamp(0.0, trace_length * 0.45);
+    let start_attachment = (start_trim <= 1e-9)
         .then(|| matching_pad_attachment(board, trace, start, direction))
         .flatten();
-    let end_attachment = (trim.end <= 1e-9)
+    let end_attachment = (end_trim <= 1e-9)
         .then(|| matching_pad_attachment(board, trace, end, reverse))
         .flatten();
     let (start_length, end_length) = effective_teardrop_lengths(
-        trace_length,
+        (trace_length - start_trim - end_trim).max(0.0),
         start_attachment.as_ref(),
         end_attachment.as_ref(),
         settings,
@@ -1959,7 +2234,18 @@ struct CornerNodeEntry {
 #[derive(Clone, Copy)]
 struct PathSample {
     point: Point,
+    tangent: Point,
     width: f64,
+}
+
+#[derive(Clone, Copy)]
+struct CircularFillet {
+    center: Point,
+    radius: f64,
+    start: Point,
+    end: Point,
+    start_angle: f64,
+    sweep: f64,
 }
 
 fn normalized(vector: Point) -> Point {
@@ -1974,22 +2260,69 @@ fn normalized(vector: Point) -> Point {
     }
 }
 
+fn circular_fillet(
+    node: Point,
+    first_direction: Point,
+    second_direction: Point,
+    reach: f64,
+    interior: f64,
+) -> Option<CircularFillet> {
+    let half_interior = interior * 0.5;
+    let sin_half = half_interior.sin();
+    let bisector = Point {
+        x: first_direction.x + second_direction.x,
+        y: first_direction.y + second_direction.y,
+    };
+    let bisector_length = (bisector.x * bisector.x + bisector.y * bisector.y).sqrt();
+    if reach <= 1e-9 || sin_half <= 1e-9 || bisector_length <= 1e-9 {
+        return None;
+    }
+    let radius = reach * half_interior.tan();
+    if !radius.is_finite() || radius <= 1e-9 {
+        return None;
+    }
+    let center_scale = radius / (sin_half * bisector_length);
+    let center = Point {
+        x: node.x + bisector.x * center_scale,
+        y: node.y + bisector.y * center_scale,
+    };
+    let start = Point {
+        x: node.x + first_direction.x * reach,
+        y: node.y + first_direction.y * reach,
+    };
+    let end = Point {
+        x: node.x + second_direction.x * reach,
+        y: node.y + second_direction.y * reach,
+    };
+    let start_radius = Point {
+        x: start.x - center.x,
+        y: start.y - center.y,
+    };
+    let end_radius = Point {
+        x: end.x - center.x,
+        y: end.y - center.y,
+    };
+    let start_angle = start_radius.y.atan2(start_radius.x);
+    let sweep = (start_radius.x * end_radius.y - start_radius.y * end_radius.x)
+        .atan2(start_radius.x * end_radius.x + start_radius.y * end_radius.y);
+    (sweep.abs() > 1e-9).then_some(CircularFillet {
+        center,
+        radius,
+        start,
+        end,
+        start_angle,
+        sweep,
+    })
+}
+
 fn swept_path_polygon(samples: &[PathSample]) -> Vec<Point> {
     if samples.len() < 2 {
         return Vec::new();
     }
-    let tangent = |index: usize| {
-        let before = samples[index.saturating_sub(1)].point;
-        let after = samples[(index + 1).min(samples.len() - 1)].point;
-        normalized(Point {
-            x: after.x - before.x,
-            y: after.y - before.y,
-        })
-    };
     let mut left = Vec::with_capacity(samples.len());
     let mut right = Vec::with_capacity(samples.len());
-    for (index, sample) in samples.iter().enumerate() {
-        let direction = tangent(index);
+    for sample in samples {
+        let direction = normalized(sample.tangent);
         let normal = Point {
             x: -direction.y,
             y: direction.x,
@@ -2005,10 +2338,10 @@ fn swept_path_polygon(samples: &[PathSample]) -> Vec<Point> {
     }
     let cap_steps = 8usize;
     let end = samples[samples.len() - 1];
-    let end_tangent = tangent(samples.len() - 1);
+    let end_tangent = normalized(end.tangent);
     let end_theta = end_tangent.y.atan2(end_tangent.x);
     let start = samples[0];
-    let start_tangent = tangent(0);
+    let start_tangent = normalized(start.tangent);
     let start_theta = start_tangent.y.atan2(start_tangent.x);
     let mut polygon = left;
     for index in 1..=cap_steps {
@@ -2027,43 +2360,6 @@ fn swept_path_polygon(samples: &[PathSample]) -> Vec<Point> {
         });
     }
     polygon
-}
-
-fn quadratic(start: Point, control: Point, end: Point, t: f64) -> Point {
-    let inverse = 1.0 - t;
-    Point {
-        x: inverse * inverse * start.x + 2.0 * inverse * t * control.x + t * t * end.x,
-        y: inverse * inverse * start.y + 2.0 * inverse * t * control.y + t * t * end.y,
-    }
-}
-
-fn quadratic_minimum_radius(start: Point, control: Point, end: Point) -> f64 {
-    let first = Point {
-        x: control.x - start.x,
-        y: control.y - start.y,
-    };
-    let second = Point {
-        x: end.x - 2.0 * control.x + start.x,
-        y: end.y - 2.0 * control.y + start.y,
-    };
-    let mut minimum = f64::INFINITY;
-    for index in 0..=24 {
-        let t = index as f64 / 24.0;
-        let derivative = Point {
-            x: 2.0 * (first.x + second.x * t),
-            y: 2.0 * (first.y + second.y * t),
-        };
-        let acceleration = Point {
-            x: 2.0 * second.x,
-            y: 2.0 * second.y,
-        };
-        let numerator = (derivative.x * derivative.x + derivative.y * derivative.y).powf(1.5);
-        let denominator = (derivative.x * acceleration.y - derivative.y * acceleration.x).abs();
-        if denominator > 1e-9 {
-            minimum = minimum.min(numerator / denominator);
-        }
-    }
-    minimum
 }
 
 fn protected_corner_node(board: &Board, point: Point) -> bool {
@@ -2085,19 +2381,114 @@ fn protected_corner_node(board: &Board, point: Point) -> bool {
 }
 
 fn same_trace_circuit(first: &Trace, second: &Trace) -> bool {
-    match (first.net_id, second.net_id) {
-        (Some(first), Some(second)) if first > 0 => first == second,
+    match (
+        positive_net_id(first.net_id),
+        positive_net_id(second.net_id),
+    ) {
+        (Some(first), Some(second)) => first == second,
         (None, None) => true,
         _ => false,
     }
 }
 
-fn trace_width(trace: &Trace, settings: &Settings) -> f64 {
+fn positive_net_id(net_id: Option<i64>) -> Option<i64> {
+    net_id.filter(|id| *id > 0)
+}
+
+fn trace_source_width_and_slope_at_distance(
+    board: &Board,
+    trace: &Trace,
+    settings: &Settings,
+    travelled: f64,
+) -> (f64, f64) {
     if settings.width_mode == "preserve" {
-        trace.width
-    } else {
-        trace.width.max(settings.trace_width)
+        return (trace.width, 0.0);
     }
+    let start = map_point(trace.start, board);
+    let end = map_point(trace.end, board);
+    let length = distance(start, end);
+    if length <= 1e-9 {
+        return (trace.width.max(settings.trace_width), 0.0);
+    }
+    let direction = Point {
+        x: (end.x - start.x) / length,
+        y: (end.y - start.y) / length,
+    };
+    let reverse = Point {
+        x: -direction.x,
+        y: -direction.y,
+    };
+    let start_attachment = matching_pad_attachment(board, trace, start, direction);
+    let end_attachment = matching_pad_attachment(board, trace, end, reverse);
+    let (start_lobe_length, end_lobe_length) = effective_teardrop_lengths(
+        length,
+        start_attachment.as_ref(),
+        end_attachment.as_ref(),
+        settings,
+    );
+    let trunk = trace.width.max(settings.trace_width);
+    let profile = VariableTraceProfile {
+        trunk,
+        neck: trunk.min(settings.neckdown_width),
+        taper: settings.taper_length,
+        start_exit: start_attachment
+            .as_ref()
+            .map(|attachment| attachment.exit + start_lobe_length),
+        end_exit: end_attachment
+            .as_ref()
+            .map(|attachment| attachment.exit + end_lobe_length),
+        style: &settings.trace_style,
+        teardrop_length: settings.teardrop_length,
+        start_shoulder: None,
+        end_shoulder: None,
+    };
+    variable_trace_width_and_slope(length, profile, travelled.clamp(0.0, length))
+}
+
+#[cfg(test)]
+fn trace_source_width_at_distance(
+    board: &Board,
+    trace: &Trace,
+    settings: &Settings,
+    travelled: f64,
+) -> f64 {
+    trace_source_width_and_slope_at_distance(board, trace, settings, travelled).0
+}
+
+fn bounded_hermite_width(
+    t: f64,
+    start: f64,
+    end: f64,
+    slopes: (f64, f64),
+    length: f64,
+    bounds: (f64, f64),
+) -> f64 {
+    let (mut first_slope, mut second_slope) = slopes;
+    let (minimum, maximum) = bounds;
+    let secant = (end - start) / length.max(1e-9);
+    if secant.abs() > 1e-9 {
+        if first_slope * secant < 0.0 {
+            first_slope = 0.0;
+        }
+        if second_slope * secant < 0.0 {
+            second_slope = 0.0;
+        }
+        let alpha = first_slope / secant;
+        let beta = second_slope / secant;
+        let magnitude = alpha.hypot(beta);
+        if magnitude > 3.0 {
+            let scale = 3.0 / magnitude;
+            first_slope *= scale;
+            second_slope *= scale;
+        }
+    }
+    let control_1 = (start + first_slope * length / 3.0).clamp(minimum, maximum);
+    let control_2 = (end - second_slope * length / 3.0).clamp(minimum, maximum);
+    let inverse = 1.0 - t;
+    inverse.powi(3) * start
+        + 3.0 * inverse * inverse * t * control_1
+        + 3.0 * inverse * t * t * control_2
+        + t.powi(3) * end
 }
 
 fn corner_geometry(board: &Board, settings: &Settings) -> (Vec<TraceTrim>, Vec<CopperFeature>) {
@@ -2158,22 +2549,43 @@ fn corner_geometry(board: &Board, settings: &Settings) -> (Vec<TraceTrim>, Vec<C
         if !(PI / 36.0..=PI * 5.0 / 6.0).contains(&deflection) {
             continue;
         }
-        let first_width = trace_width(first_trace, settings);
-        let second_width = trace_width(second_trace, settings);
         let wanted = settings.corner_radius * (deflection * 0.5).tan();
         let reach = wanted.min(first.length * 0.34).min(second.length * 0.34);
+        let first_join = trace_source_width_and_slope_at_distance(
+            board,
+            first_trace,
+            settings,
+            if first.at_start {
+                reach
+            } else {
+                first.length - reach
+            },
+        );
+        let second_join = trace_source_width_and_slope_at_distance(
+            board,
+            second_trace,
+            settings,
+            if second.at_start {
+                reach
+            } else {
+                second.length - reach
+            },
+        );
+        let first_width = first_join.0;
+        let second_width = second_join.0;
         if reach < first_width.max(second_width) * 0.3 {
             continue;
         }
-        let start = Point {
-            x: first.node.x + first_direction.x * reach,
-            y: first.node.y + first_direction.y * reach,
+        let Some(fillet) = circular_fillet(
+            first.node,
+            first_direction,
+            second_direction,
+            reach,
+            interior,
+        ) else {
+            continue;
         };
-        let end = Point {
-            x: second.node.x + second_direction.x * reach,
-            y: second.node.y + second_direction.y * reach,
-        };
-        if quadratic_minimum_radius(start, first.node, end) < first_width.max(second_width) * 0.55 {
+        if fillet.radius < first_width.max(second_width) * 0.55 {
             continue;
         }
         if first.at_start {
@@ -2186,21 +2598,74 @@ fn corner_geometry(board: &Board, settings: &Settings) -> (Vec<TraceTrim>, Vec<C
         } else {
             trims[second.trace_index].end = trims[second.trace_index].end.max(reach);
         }
-        let steps = ((deflection / (PI / 24.0)).ceil() as usize).clamp(8, 24);
+        let steps = ((deflection / (PI / 36.0)).ceil() as usize).clamp(12, 36);
+        let length = fillet.radius * fillet.sweep.abs();
+        let first_slope = first_join.1 * if first.at_start { -1.0 } else { 1.0 };
+        let second_slope = second_join.1 * if second.at_start { 1.0 } else { -1.0 };
+        let minimum_width = first_width
+            .min(second_width)
+            .min(
+                first_trace
+                    .width
+                    .max(settings.trace_width)
+                    .min(settings.neckdown_width),
+            )
+            .min(
+                second_trace
+                    .width
+                    .max(settings.trace_width)
+                    .min(settings.neckdown_width),
+            );
+        let maximum_width = first_width
+            .max(second_width)
+            .max(first_trace.width.max(settings.trace_width))
+            .max(second_trace.width.max(settings.trace_width));
         let samples: Vec<_> = (0..=steps)
             .map(|index| {
                 let t = index as f64 / steps as f64;
+                let angle = fillet.start_angle + fillet.sweep * t;
+                let radial = Point {
+                    x: angle.cos(),
+                    y: angle.sin(),
+                };
                 PathSample {
-                    point: quadratic(start, first.node, end, t),
-                    width: first_width + (second_width - first_width) * smootherstep(t),
+                    point: if index == 0 {
+                        fillet.start
+                    } else if index == steps {
+                        fillet.end
+                    } else {
+                        Point {
+                            x: fillet.center.x + radial.x * fillet.radius,
+                            y: fillet.center.y + radial.y * fillet.radius,
+                        }
+                    },
+                    tangent: if fillet.sweep >= 0.0 {
+                        Point {
+                            x: -radial.y,
+                            y: radial.x,
+                        }
+                    } else {
+                        Point {
+                            x: radial.y,
+                            y: -radial.x,
+                        }
+                    },
+                    width: bounded_hermite_width(
+                        t,
+                        first_width,
+                        second_width,
+                        (first_slope, second_slope),
+                        length,
+                        (minimum_width, maximum_width),
+                    ),
                 }
             })
             .collect();
         features.push(CopperFeature {
             polygon: swept_path_polygon(&samples),
-            net_id: first_trace.net_id,
+            net_id: positive_net_id(first_trace.net_id),
             net_name: first_trace.net_name.clone(),
-            anchors: vec![start, end],
+            anchors: vec![fillet.start, fillet.end],
         });
     }
     (trims, features)
@@ -2330,7 +2795,7 @@ fn build_regions(
         let polygon = trace_polygon_with_trim(board, trace, settings, trace_trims[trace_index]);
         features.push(CopperFeature {
             polygon,
-            net_id: trace.net_id,
+            net_id: positive_net_id(trace.net_id),
             net_name: trace.net_name.clone(),
             anchors: vec![start, end],
         });
@@ -2339,7 +2804,7 @@ fn build_regions(
         {
             features.push(CopperFeature {
                 polygon: lobe,
-                net_id: trace.net_id,
+                net_id: positive_net_id(trace.net_id),
                 net_name: trace.net_name.clone(),
                 anchors: vec![start, end],
             });
@@ -2356,7 +2821,7 @@ fn build_regions(
         validate_annulus(&polygon, mapped.position, drills)?;
         features.push(CopperFeature {
             polygon,
-            net_id: pad.net_id,
+            net_id: positive_net_id(pad.net_id),
             net_name: pad.net_name.clone(),
             anchors: vec![mapped.position],
         });
@@ -2371,7 +2836,7 @@ fn build_regions(
         validate_annulus(&polygon, center, drills)?;
         features.push(CopperFeature {
             polygon,
-            net_id: via.net_id,
+            net_id: positive_net_id(via.net_id),
             net_name: via.net_name.clone(),
             anchors: vec![center],
         });
@@ -2430,7 +2895,7 @@ fn build_regions(
             features.push(CopperFeature {
                 anchors: polygon.clone(),
                 polygon,
-                net_id: zone.net_id,
+                net_id: positive_net_id(zone.net_id),
                 net_name: zone.net_name.clone(),
             });
         }
@@ -2516,14 +2981,11 @@ fn build_regions(
             }
         }
         let all: PolyShapes = groups.into_iter().flat_map(|group| group.2).collect();
-        boolean_shapes(&all, &board_outer, OverlayRule::Subject)?
+        boolean_shapes(&all, &board_outer, OverlayRule::Intersect)?
     };
     reject_point_tangencies(&copper_region)?;
-    let board_top_region = if copper_region.is_empty() {
-        board_region.clone()
-    } else {
-        boolean_shapes(&board_region, &copper_region, OverlayRule::Difference)?
-    };
+    let (board_region, board_top_region, copper_region) =
+        partition_shapes(&board_region, &copper_region)?;
     Ok((board_region, copper_region, board_top_region))
 }
 
@@ -2586,32 +3048,32 @@ pub fn generate_stl(board: &Board, settings: &Settings) -> Result<Vec<u8>, Strin
             return Err("a compensated drill lies outside or intersects the board outline".into());
         }
     }
-    let (_board_region, copper_region, board_top_region) =
+    let (board_region, copper_region, board_top_region) =
         build_regions(board, settings, outline, &drills)?;
+    let partition = node_partition(&[&board_top_region, &copper_region, &board_region]);
+    let (board_top_region, copper_region, board_region) =
+        (&partition[0], &partition[1], &partition[2]);
     let mut mesh = Mesh::new();
-    // P (plain board top) and R (raised copper) form an exact partition of Q
-    // (board minus drills). Triangulating that same partition at the bottom and
-    // canceling shared contour edges keeps partial board-edge clips manifold.
-    mesh.horizontal(&board_top_region, 0.0, false)?;
-    mesh.horizontal(&copper_region, 0.0, false)?;
-    mesh.vertical_partition_boundary(
-        &[&board_top_region, &copper_region],
-        0.0,
-        settings.board_thickness,
-    );
-    mesh.horizontal(&board_top_region, settings.board_thickness, true)?;
+    // Q (board minus drills) is a single solid below the raised copper. Emit
+    // one bottom and one exterior wall from Q; P (plain board top) and R
+    // (raised copper) only partition its stepped top. Noding all three regions
+    // preserves every transition vertex where R meets the board boundary.
+    mesh.horizontal(board_region, 0.0, false)?;
+    mesh.vertical(board_region, 0.0, settings.board_thickness);
+    mesh.horizontal(board_top_region, settings.board_thickness, true)?;
     if !copper_region.is_empty() {
         mesh.vertical(
-            &copper_region,
+            copper_region,
             settings.board_thickness,
             settings.board_thickness + settings.trace_height,
         );
         mesh.horizontal(
-            &copper_region,
+            copper_region,
             settings.board_thickness + settings.trace_height,
             true,
         )?;
     }
+    mesh.validate_closed_manifold()?;
     Ok(mesh.binary_stl())
 }
 
@@ -2796,6 +3258,26 @@ mod tests {
     }
 
     #[test]
+    fn bottom_footprint_transform_warning_does_not_block_export() {
+        let source = r#"(kicad_pcb (version 20240108)
+          (net 1 "SIG")
+          (gr_rect (start 0 0) (end 20 20) (layer "Edge.Cuts"))
+          (segment (start 4 10) (end 16 10) (width 1) (layer "B.Cu") (net 1))
+          (footprint "Legacy:Back" (layer "B.Cu") (at 4 10)
+            (pad "1" thru_hole circle (at 0 0) (size 3 3) (drill 1)
+              (layers "*.Cu") (net 1 "SIG"))))"#;
+        let board = parse_kicad(source).unwrap();
+        let issue = board
+            .warnings
+            .iter()
+            .find(|warning| warning.code == "BOTTOM_FOOTPRINT_TRANSFORM_APPROXIMATED")
+            .expect("missing bottom-footprint warning");
+
+        assert_eq!(issue.severity, Severity::Warning);
+        assert!(generate_stl(&board, &standard_settings()).is_ok());
+    }
+
+    #[test]
     fn fractured_filled_zone_preserves_an_internal_void() {
         let source = r#"(kicad_pcb (version 20240108)
           (net 1 "GND")
@@ -2892,25 +3374,31 @@ mod tests {
             assert!(triangle
                 .iter()
                 .all(|vertex| allowed_z.iter().any(|z| (vertex[2] - z).abs() < 1e-5)));
+            let grid_keys = triangle.map(|vertex| {
+                vertex.map(|coordinate| (f64::from(coordinate) * OVERLAY_SCALE).round() as i64)
+            });
+            assert!(
+                grid_keys[0] != grid_keys[1]
+                    && grid_keys[1] != grid_keys[2]
+                    && grid_keys[2] != grid_keys[0],
+                "collapsed triangle {triangle:?}"
+            );
             let ab = [
-                triangle[1][0] - triangle[0][0],
-                triangle[1][1] - triangle[0][1],
-                triangle[1][2] - triangle[0][2],
+                grid_keys[1][0] as i128 - grid_keys[0][0] as i128,
+                grid_keys[1][1] as i128 - grid_keys[0][1] as i128,
+                grid_keys[1][2] as i128 - grid_keys[0][2] as i128,
             ];
             let ac = [
-                triangle[2][0] - triangle[0][0],
-                triangle[2][1] - triangle[0][1],
-                triangle[2][2] - triangle[0][2],
+                grid_keys[2][0] as i128 - grid_keys[0][0] as i128,
+                grid_keys[2][1] as i128 - grid_keys[0][1] as i128,
+                grid_keys[2][2] as i128 - grid_keys[0][2] as i128,
             ];
             let cross = [
                 ab[1] * ac[2] - ab[2] * ac[1],
                 ab[2] * ac[0] - ab[0] * ac[2],
                 ab[0] * ac[1] - ab[1] * ac[0],
             ];
-            assert!(
-                cross.iter().map(|v| v * v).sum::<f32>() > 1e-12,
-                "degenerate triangle {triangle:?}"
-            );
+            assert!(cross != [0, 0, 0], "degenerate triangle {triangle:?}");
             let keys = triangle.map(vertex_key);
             let mut face = keys;
             face.sort();
@@ -2937,6 +3425,42 @@ mod tests {
             assert_eq!(directed_edges.get(&(b, a)).copied().unwrap_or(0), 1);
         }
         assert!(signed_volume > 0.0, "mesh has non-positive signed volume");
+    }
+
+    fn assert_closed_manifold_after_weld(stl: &[u8], tolerance: f64) {
+        type WeldedKey = [i64; 3];
+        let key = |vertex: [f32; 3]| {
+            vertex.map(|coordinate| (f64::from(coordinate) / tolerance).round() as i64)
+        };
+        let mut directed_edges = HashMap::<(WeldedKey, WeldedKey), usize>::new();
+        let mut undirected_edges = HashMap::<(WeldedKey, WeldedKey), usize>::new();
+        let mut faces = HashSet::<[WeldedKey; 3]>::new();
+        for triangle in stl_triangles(stl) {
+            let keys = triangle.map(key);
+            assert!(
+                keys[0] != keys[1] && keys[1] != keys[2] && keys[2] != keys[0],
+                "triangle collapsed after a {tolerance} mm weld: {triangle:?}"
+            );
+            let mut face = keys;
+            face.sort();
+            assert!(
+                faces.insert(face),
+                "duplicate triangle after a {tolerance} mm weld"
+            );
+            for (a, b) in [(keys[0], keys[1]), (keys[1], keys[2]), (keys[2], keys[0])] {
+                *directed_edges.entry((a, b)).or_default() += 1;
+                let edge = if a <= b { (a, b) } else { (b, a) };
+                *undirected_edges.entry(edge).or_default() += 1;
+            }
+        }
+        for (&(a, b), &count) in &undirected_edges {
+            assert_eq!(
+                count, 2,
+                "non-manifold edge after a {tolerance} mm weld: {a:?}--{b:?}"
+            );
+            assert_eq!(directed_edges.get(&(a, b)).copied().unwrap_or(0), 1);
+            assert_eq!(directed_edges.get(&(b, a)).copied().unwrap_or(0), 1);
+        }
     }
 
     fn point_in_triangle(point: (f32, f32), tri: [[f32; 3]; 3]) -> bool {
@@ -3356,6 +3880,156 @@ mod tests {
     }
 
     #[test]
+    fn shared_partition_graph_nodes_boundary_transitions() {
+        let board: PolyShapes = vec![vec![vec![[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]]]];
+        let copper: PolyShapes = vec![vec![vec![
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.5],
+        ]]];
+        let (board, plain, copper) = partition_shapes(&board, &copper).unwrap();
+        let partition = node_partition(&[&plain, &copper, &board]);
+        let (plain, copper, board) = (&partition[0], &partition[1], &partition[2]);
+        let mut mesh = Mesh::new();
+        mesh.horizontal(board, 0.0, false).unwrap();
+        mesh.vertical(board, 0.0, 1.0);
+        mesh.horizontal(plain, 1.0, true).unwrap();
+        mesh.vertical(copper, 1.0, 2.0);
+        mesh.horizontal(copper, 2.0, true).unwrap();
+        mesh.validate_closed_manifold().unwrap();
+        let stl = mesh.binary_stl();
+
+        assert_closed_manifold(&stl, &[0.0, 1.0, 2.0]);
+        assert_closed_manifold_after_weld(&stl, 1e-5);
+    }
+
+    #[test]
+    fn mesh_validation_accepts_non_collinear_faces_at_grid_resolution() {
+        let [a, b, c] = [
+            Point { x: 0.0, y: 0.0 },
+            Point {
+                x: 1.0 / OVERLAY_SCALE,
+                y: 0.0,
+            },
+            Point { x: 0.0, y: 0.05 },
+        ];
+        let (z0, z1) = (0.0, 1.0);
+        let mut mesh = Mesh::new();
+        mesh.triangle(v3(a, z0), v3(c, z0), v3(b, z0));
+        mesh.triangle(v3(a, z1), v3(b, z1), v3(c, z1));
+        for (start, end) in [(a, b), (b, c), (c, a)] {
+            mesh.triangle(v3(start, z0), v3(end, z0), v3(end, z1));
+            mesh.triangle(v3(start, z0), v3(end, z1), v3(start, z1));
+        }
+
+        mesh.validate_closed_manifold().unwrap();
+        assert_closed_manifold_after_weld(&mesh.binary_stl(), 1.0 / OVERLAY_SCALE);
+    }
+
+    #[test]
+    fn angled_edge_clip_is_manifold_after_slicer_precision_weld() {
+        let mut board = plain_board();
+        board.outline = vec![
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 30.0, y: 0.0 },
+            Point { x: 30.0, y: 12.0 },
+            Point { x: 25.0, y: 20.0 },
+            Point { x: 5.0, y: 20.0 },
+            Point { x: 0.0, y: 13.0 },
+        ];
+        board.traces.push(net_trace(
+            Point {
+                x: 13.770551132038236,
+                y: 10.79933114349842,
+            },
+            Point {
+                x: 33.33822785876691,
+                y: 16.126999682746828,
+            },
+            1.7006752873654478,
+            1,
+            "EDGE",
+        ));
+        let settings = Settings {
+            trace_height: 0.95,
+            width_mode: "preserve".into(),
+            trace_style: "technical".into(),
+            trace_clearance: 0.0,
+            hole_compensation: 0.0,
+            ..standard_settings()
+        };
+        let stl = generate_stl(&board, &settings).unwrap();
+
+        assert_closed_manifold(&stl, &[0.0, 1.6, 2.55]);
+        assert_closed_manifold_after_weld(&stl, 1e-5);
+    }
+
+    #[test]
+    fn shallow_trace_and_zone_edge_clips_share_partition_vertices() {
+        let mut board = plain_board();
+        board.traces.push(net_trace(
+            Point { x: 5.0, y: 0.00007 },
+            Point {
+                x: 35.0,
+                y: 0.00007,
+            },
+            0.1,
+            1,
+            "EDGE",
+        ));
+        let mut settings = standard_settings();
+        settings.width_mode = "preserve".into();
+        settings.trace_clearance = 0.0;
+        let stl = generate_stl(&board, &settings).unwrap();
+        assert_closed_manifold(&stl, &[0.0, 1.6, 2.0]);
+        assert_closed_manifold_after_weld(&stl, 1e-5);
+
+        board.traces.clear();
+        board.zones.push(CopperZone {
+            layer: "B.Cu".into(),
+            net_id: Some(1),
+            net_name: Some("EDGE".into()),
+            name: None,
+            kind: "copper".into(),
+            polygons: vec![vec![
+                Point { x: -1.0, y: 20.0 },
+                Point {
+                    x: 0.1,
+                    y: 20.00013,
+                },
+                Point { x: 31.0, y: 10.0 },
+            ]],
+        });
+        let stl = generate_stl(&board, &settings).unwrap();
+        assert_closed_manifold(&stl, &[0.0, 1.6, 2.0]);
+        assert_closed_manifold_after_weld(&stl, 1e-5);
+
+        let mut drilled = plain_board();
+        let mut npth = tht_pad(
+            Point { x: 15.0, y: 10.0 },
+            Point { x: 2.0, y: 2.0 },
+            Some(2.0),
+            "circle",
+        );
+        npth.pad_type = "np_thru_hole".into();
+        drilled.pads.push(npth);
+        drilled.traces.push(net_trace(
+            Point { x: 5.0, y: 10.0 },
+            Point { x: 25.0, y: 10.0 },
+            1.0,
+            1,
+            "EDGE",
+        ));
+        let mut drill_settings = settings;
+        drill_settings.hole_compensation = 0.0;
+        let stl = generate_stl(&drilled, &drill_settings).unwrap();
+        assert_closed_manifold(&stl, &[0.0, 1.6, 2.0]);
+        assert_closed_manifold_after_weld(&stl, 1e-5);
+    }
+
+    #[test]
     fn empty_and_whole_board_copper_are_manifold() {
         let board = plain_board();
         let settings = standard_settings();
@@ -3475,10 +4149,41 @@ mod tests {
 
     #[test]
     fn vintage_corner_blends_only_degree_two_nodes_and_stays_manifold() {
+        let fillet = circular_fillet(
+            Point { x: 15.0, y: 10.0 },
+            Point { x: -1.0, y: 0.0 },
+            Point { x: 0.0, y: 1.0 },
+            3.0,
+            PI / 2.0,
+        )
+        .unwrap();
+        assert!((fillet.center.x - 12.0).abs() < 1e-12);
+        assert!((fillet.center.y - 13.0).abs() < 1e-12);
+        assert!((fillet.radius - 3.0).abs() < 1e-12);
+        assert!((fillet.sweep - PI / 2.0).abs() < 1e-12);
+        for index in 0..=12 {
+            let angle = fillet.start_angle + fillet.sweep * index as f64 / 12.0;
+            let point = Point {
+                x: fillet.center.x + angle.cos() * fillet.radius,
+                y: fillet.center.y + angle.sin() * fillet.radius,
+            };
+            assert!((distance(point, fillet.center) - 3.0).abs() < 1e-12);
+        }
+        let reversed_fillet = circular_fillet(
+            Point { x: 15.0, y: 10.0 },
+            Point { x: 0.0, y: 1.0 },
+            Point { x: -1.0, y: 0.0 },
+            3.0,
+            PI / 2.0,
+        )
+        .unwrap();
+        assert!((reversed_fillet.radius - fillet.radius).abs() < 1e-12);
+        assert!((reversed_fillet.sweep + fillet.sweep).abs() < 1e-12);
+
         let mut board = plain_board();
         board.traces = vec![
             net_trace(
-                Point { x: 5.0, y: 10.0 },
+                Point { x: 9.0, y: 10.0 },
                 Point { x: 15.0, y: 10.0 },
                 0.6,
                 1,
@@ -3492,12 +4197,45 @@ mod tests {
                 "BEND",
             ),
         ];
+        board
+            .pads
+            .push(net_pad(Point { x: 9.0, y: 10.0 }, 1, "BEND"));
         let mut settings = standard_settings();
         settings.trace_style = "vintage".into();
         let (trims, corners) = corner_geometry(&board, &settings);
         assert_eq!(corners.len(), 1);
         assert!(trims[0].end > 0.0);
         assert!(trims[1].start > 0.0);
+        let expected_join_width = trace_source_width_at_distance(
+            &board,
+            &board.traces[0],
+            &settings,
+            distance(
+                map_point(board.traces[0].start, &board),
+                map_point(board.traces[0].end, &board),
+            ) - trims[0].end,
+        );
+        let corner_join_width = distance(corners[0].polygon[0], corners[0].anchors[0]) * 2.0;
+        assert!((corner_join_width - expected_join_width).abs() < 1e-9);
+        assert!(corner_join_width < settings.trace_width - 0.3);
+        let lobes =
+            trace_teardrop_polygons_with_trim(&board, &board.traces[0], &settings, trims[0]);
+        let source_start = map_point(board.traces[0].start, &board);
+        let source_end = map_point(board.traces[0].end, &board);
+        let source_length = distance(source_start, source_end);
+        let source_direction = Point {
+            x: (source_end.x - source_start.x) / source_length,
+            y: (source_end.y - source_start.y) / source_length,
+        };
+        let maximum_lobe_distance = lobes
+            .iter()
+            .flatten()
+            .map(|point| {
+                (point.x - source_start.x) * source_direction.x
+                    + (point.y - source_start.y) * source_direction.y
+            })
+            .fold(0.0, f64::max);
+        assert!(maximum_lobe_distance <= source_length - trims[0].end + 1e-9);
         assert_closed_manifold(&generate_stl(&board, &settings).unwrap(), &[0.0, 1.6, 2.0]);
 
         board.traces.push(net_trace(
@@ -3526,6 +4264,106 @@ mod tests {
             ),
         ];
         assert!(corner_geometry(&board, &settings).1.is_empty());
+    }
+
+    #[test]
+    fn vintage_corner_preserves_taper_width_slope_without_overshoot() {
+        let mut board = plain_board();
+        board.traces = vec![
+            net_trace(
+                Point { x: 2.0, y: 10.0 },
+                Point { x: 13.0, y: 10.0 },
+                0.6,
+                1,
+                "FLOW",
+            ),
+            net_trace(
+                Point { x: 13.0, y: 10.0 },
+                Point { x: 13.0, y: 18.0 },
+                0.6,
+                1,
+                "FLOW",
+            ),
+        ];
+        let mut source_pad = net_pad(Point { x: 2.0, y: 10.0 }, 1, "FLOW");
+        source_pad.size = Point { x: 4.0, y: 4.0 };
+        board.pads.push(source_pad);
+        let mut settings = standard_settings();
+        settings.trace_style = "vintage".into();
+        settings.trace_width = 2.5;
+        settings.taper_length = 6.0;
+        settings.teardrop_strength = 0.55;
+        settings.corner_radius = 3.0;
+
+        let (trims, corners) = corner_geometry(&board, &settings);
+        assert_eq!(corners.len(), 1);
+        let first_length = distance(
+            map_point(board.traces[0].start, &board),
+            map_point(board.traces[0].end, &board),
+        );
+        let first_join = trace_source_width_and_slope_at_distance(
+            &board,
+            &board.traces[0],
+            &settings,
+            first_length - trims[0].end,
+        );
+        let second_join = trace_source_width_and_slope_at_distance(
+            &board,
+            &board.traces[1],
+            &settings,
+            trims[1].start,
+        );
+        let arc_length = trims[0].end * PI / 2.0;
+        let step = 1.0 / 18.0;
+        let chord_length = arc_length * step;
+        let previous_width = trace_source_width_at_distance(
+            &board,
+            &board.traces[0],
+            &settings,
+            first_length - trims[0].end - chord_length,
+        );
+        let incoming_chord_slope = (first_join.0 - previous_width) / chord_length;
+        let next_width = bounded_hermite_width(
+            step,
+            first_join.0,
+            second_join.0,
+            (first_join.1, second_join.1),
+            arc_length,
+            (settings.neckdown_width, settings.trace_width),
+        );
+        let first_chord_slope = (next_width - first_join.0) / chord_length;
+
+        assert!(first_join.1 > 0.1);
+        assert!(
+            (incoming_chord_slope - first_chord_slope).abs() < 0.05,
+            "width slope jumped from {} to {}",
+            incoming_chord_slope,
+            first_chord_slope
+        );
+        for index in 0..=18 {
+            let t = index as f64 / 18.0;
+            let width = bounded_hermite_width(
+                t,
+                first_join.0,
+                second_join.0,
+                (first_join.1, second_join.1),
+                arc_length,
+                (settings.neckdown_width, settings.trace_width),
+            );
+            assert!(
+                (settings.neckdown_width - 1e-9..=settings.trace_width + 1e-9).contains(&width)
+            );
+            let reversed = bounded_hermite_width(
+                1.0 - t,
+                second_join.0,
+                first_join.0,
+                (-second_join.1, -first_join.1),
+                arc_length,
+                (settings.neckdown_width, settings.trace_width),
+            );
+            assert!((width - reversed).abs() < 1e-12);
+        }
+        assert_closed_manifold(&generate_stl(&board, &settings).unwrap(), &[0.0, 1.6, 2.0]);
     }
 
     #[test]
@@ -3577,6 +4415,32 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_vintage_tapers_have_a_flat_midpoint() {
+        let polygon = variable_trace_polygon(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 20.0, y: 0.0 },
+            VariableTraceProfile {
+                trunk: 3.0,
+                neck: 1.4,
+                taper: 12.0,
+                start_exit: Some(5.0),
+                end_exit: Some(5.0),
+                style: "vintage",
+                teardrop_length: 3.0,
+                start_shoulder: None,
+                end_shoulder: None,
+            },
+        );
+        let left = vertical_span(&polygon, 9.8);
+        let middle = vertical_span(&polygon, 10.0);
+        let right = vertical_span(&polygon, 10.2);
+
+        assert!(middle >= left && middle >= right);
+        assert!((left - right).abs() < 1e-9);
+        assert!(middle - left < 0.01, "midpoint rise was {}", middle - left);
+    }
+
+    #[test]
     fn same_net_t_junction_is_legal_and_different_net_overlap_is_rejected() {
         let mut board = plain_board();
         board.traces = vec![
@@ -3614,5 +4478,32 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("near ("));
+    }
+
+    #[test]
+    fn zero_net_ids_use_legacy_coordinate_connectivity() {
+        let mut board = plain_board();
+        board.traces = vec![
+            net_trace(
+                Point { x: 5.0, y: 10.0 },
+                Point { x: 25.0, y: 10.0 },
+                0.5,
+                0,
+                "",
+            ),
+            net_trace(
+                Point { x: 15.0, y: 10.0 },
+                Point { x: 15.0, y: 3.0 },
+                0.5,
+                0,
+                "",
+            ),
+        ];
+        let settings = standard_settings();
+        assert_closed_manifold(&generate_stl(&board, &settings).unwrap(), &[0.0, 1.6, 2.0]);
+
+        board.traces[1].start = Point { x: 15.0, y: 16.0 };
+        let error = generate_stl(&board, &settings).unwrap_err();
+        assert!(error.contains("copper collision between"), "{error}");
     }
 }

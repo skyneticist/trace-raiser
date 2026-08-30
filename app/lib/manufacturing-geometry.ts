@@ -1,7 +1,7 @@
 import type { GeneratorSettings, Pad, ParsedBoard, Point, Trace } from "./pcb-core";
 
 export type WidthSample = { t: number; width: number };
-export type CenterSample = WidthSample & { point: Point };
+export type CenterSample = WidthSample & { point: Point; tangent?: Point };
 
 export type TraceProfile = {
   trace: Trace;
@@ -28,10 +28,15 @@ export function buildTraceProfiles(board: ParsedBoard, settings: GeneratorSettin
   const pads = board.pads.filter(isSupportedBackPad);
   const traces = board.traces.filter((trace) => trace.layer === "B.Cu");
   const trims = traces.map(() => ({ start: 0, end: 0 }));
+  const untrimmed = traces.map((trace) => buildTraceProfile(trace, pads, settings));
   const corners = settings.width_mode === "auto" && settings.trace_style === "vintage"
-    ? buildCornerProfiles(board, traces, settings, trims)
+    ? buildCornerProfiles(board, traces, settings, trims, untrimmed)
     : [];
-  const straight = traces.map((trace, index) => buildTraceProfile(trace, pads, settings, trims[index]));
+  const straight = traces.map((trace, index) => (
+    trims[index].start > EPSILON || trims[index].end > EPSILON
+      ? buildTraceProfile(trace, pads, settings, trims[index])
+      : untrimmed[index]
+  ));
   return [...straight, ...corners];
 }
 
@@ -82,7 +87,7 @@ export function buildTraceProfile(
     ? matchingPadAttachment(trace, pads, trace.end, { x: -direction.x, y: -direction.y })
     : null;
   const [startLobeLength, endLobeLength] = effectiveTeardropLengths(
-    sourceLength,
+    length,
     startAttachment,
     endAttachment,
     settings,
@@ -160,27 +165,58 @@ export function widthAt(profile: TraceProfile, t: number, taperLength: number) {
 }
 
 function widthAtDistance(profile: TraceProfile, distance: number, taperLength: number) {
-  const allowance = (fromExit: number, travelled: number) => {
+  return widthAndSlopeAtDistance(profile, distance, taperLength).width;
+}
+
+function smootherstepDerivative(value: number) {
+  if (value <= 0 || value >= 1) return 0;
+  return 30 * value * value * (value - 1) * (value - 1);
+}
+
+function widthAndSlopeAtDistance(profile: TraceProfile, distance: number, taperLength: number) {
+  const allowance = (fromExit: number, travelled: number, orientation: number) => {
     const progress = clamp((travelled - fromExit) / taperLength, 0, 1);
     const eased = profile.style === "technical" ? progress : smootherstep(progress);
-    return profile.neckWidth + (profile.trunkWidth - profile.neckWidth) * eased;
+    const derivative = progress > 0 && progress < 1
+      ? (profile.trunkWidth - profile.neckWidth)
+        * (profile.style === "technical" ? 1 : smootherstepDerivative(progress))
+        / taperLength * orientation
+      : 0;
+    return {
+      width: profile.neckWidth + (profile.trunkWidth - profile.neckWidth) * eased,
+      slope: derivative,
+    };
   };
-  const candidates = [];
-  if (profile.startExit !== null) candidates.push(allowance(profile.startExit, distance));
-  if (profile.endExit !== null) candidates.push(allowance(profile.endExit, profile.length - distance));
+  const candidates: { width: number; slope: number }[] = [];
+  if (profile.startExit !== null) candidates.push(allowance(profile.startExit, distance, 1));
+  if (profile.endExit !== null) candidates.push(allowance(profile.endExit, profile.length - distance, -1));
+  const widthRange = profile.trunkWidth - profile.neckWidth;
+  if (profile.style !== "technical" && candidates.length === 2 && widthRange > EPSILON) {
+    // Smooth modes treat each endpoint envelope as permission to widen. Their
+    // product preserves single-ended tapers and removes the hard-min cusp when
+    // two tapers overlap.
+    const firstPermission = clamp((candidates[0].width - profile.neckWidth) / widthRange, 0, 1);
+    const secondPermission = clamp((candidates[1].width - profile.neckWidth) / widthRange, 0, 1);
+    return {
+      width: profile.neckWidth + widthRange * firstPermission * secondPermission,
+      slope: candidates[0].slope * secondPermission + candidates[1].slope * firstPermission,
+    };
+  }
   return candidates.reduce((selected, candidate) => {
-    const selectedChange = Math.abs(selected - profile.trunkWidth);
-    const candidateChange = Math.abs(candidate - profile.trunkWidth);
+    const selectedChange = Math.abs(selected.width - profile.trunkWidth);
+    const candidateChange = Math.abs(candidate.width - profile.trunkWidth);
     return candidateChange > selectedChange + EPSILON
-      || Math.abs(candidateChange - selectedChange) <= EPSILON && candidate < selected
+      || Math.abs(candidateChange - selectedChange) <= EPSILON && candidate.width < selected.width
       ? candidate
       : selected;
-  }, profile.trunkWidth);
+  }, { width: profile.trunkWidth, slope: 0 });
 }
 
 export function traceProfilePolygon(profile: TraceProfile, extraWidth = 0, capSteps = 8): Point[] {
   if (profile.length <= EPSILON || profile.centerline.length < 2) return [];
   const tangentAt = (index: number) => {
+    const exact = profile.centerline[index].tangent;
+    if (exact) return normalize(exact);
     const before = profile.centerline[Math.max(0, index - 1)].point;
     const after = profile.centerline[Math.min(profile.centerline.length - 1, index + 1)].point;
     return normalize({ x: after.x - before.x, y: after.y - before.y });
@@ -222,6 +258,7 @@ function buildCornerProfiles(
   traces: Trace[],
   settings: GeneratorSettings,
   trims: TraceTrim[],
+  untrimmed: TraceProfile[],
 ) {
   const nodes = new Map<string, NodeEntry[]>();
   traces.forEach((trace, traceIndex) => {
@@ -251,35 +288,55 @@ function buildCornerProfiles(
     const deflection = Math.PI - interior;
     if (deflection < Math.PI / 36 || deflection > Math.PI * 5 / 6) continue;
 
-    const firstWidth = effectiveTraceWidth(firstTrace, settings);
-    const secondWidth = effectiveTraceWidth(secondTrace, settings);
     const wanted = settings.corner_radius * Math.tan(deflection / 2);
     const reach = Math.min(wanted, first.length * 0.34, second.length * 0.34);
+    const firstProfile = untrimmed[first.traceIndex];
+    const secondProfile = untrimmed[second.traceIndex];
+    const firstDistance = first.atStart ? reach : firstProfile.length - reach;
+    const secondDistance = second.atStart ? reach : secondProfile.length - reach;
+    const taperLength = Math.max(settings.taper_length, EPSILON);
+    const firstJoin = widthAndSlopeAtDistance(firstProfile, firstDistance, taperLength);
+    const secondJoin = widthAndSlopeAtDistance(secondProfile, secondDistance, taperLength);
+    const firstWidth = firstJoin.width;
+    const secondWidth = secondJoin.width;
     if (reach < Math.max(firstWidth, secondWidth) * 0.3) continue;
 
-    const start = add(first.node, scale(firstDirection, reach));
-    const end = add(second.node, scale(secondDirection, reach));
-    if (quadraticMinimumRadius(start, first.node, end) < Math.max(firstWidth, secondWidth) * 0.55) continue;
+    const fillet = circularFillet(first.node, firstDirection, secondDirection, reach, interior);
+    if (!fillet || fillet.radius < Math.max(firstWidth, secondWidth) * 0.55) continue;
+    const { start, end } = fillet;
 
     if (first.atStart) trims[first.traceIndex].start = Math.max(trims[first.traceIndex].start, reach);
     else trims[first.traceIndex].end = Math.max(trims[first.traceIndex].end, reach);
     if (second.atStart) trims[second.traceIndex].start = Math.max(trims[second.traceIndex].start, reach);
     else trims[second.traceIndex].end = Math.max(trims[second.traceIndex].end, reach);
 
-    const steps = Math.min(24, Math.max(8, Math.ceil(deflection / (Math.PI / 24))));
+    const steps = Math.min(36, Math.max(12, Math.ceil(deflection / (Math.PI / 36))));
+    const length = fillet.radius * Math.abs(fillet.sweep);
+    const firstSlope = firstJoin.slope * (first.atStart ? -1 : 1);
+    const secondSlope = secondJoin.slope * (second.atStart ? 1 : -1);
+    const minimumWidth = Math.min(firstProfile.neckWidth, secondProfile.neckWidth, firstWidth, secondWidth);
+    const maximumWidth = Math.max(firstProfile.trunkWidth, secondProfile.trunkWidth, firstWidth, secondWidth);
     const centerline: CenterSample[] = [];
     for (let index = 0; index <= steps; index += 1) {
       const t = index / steps;
+      const angle = fillet.startAngle + fillet.sweep * t;
+      const radial = { x: Math.cos(angle), y: Math.sin(angle) };
       centerline.push({
         t,
-        point: quadratic(start, first.node, end, t),
-        width: firstWidth + (secondWidth - firstWidth) * smootherstep(t),
+        point: index === 0 ? start : index === steps ? end : add(fillet.center, scale(radial, fillet.radius)),
+        tangent: fillet.sweep >= 0 ? { x: -radial.y, y: radial.x } : { x: radial.y, y: -radial.x },
+        width: boundedHermiteWidth(
+          t,
+          firstWidth,
+          secondWidth,
+          firstSlope,
+          secondSlope,
+          length,
+          minimumWidth,
+          maximumWidth,
+        ),
       });
     }
-    const length = centerline.slice(1).reduce(
-      (total, sample, index) => total + distance(centerline[index].point, sample.point),
-      0,
-    );
     corners.push({
       trace: { ...firstTrace, start, end, width: Math.min(firstTrace.width, secondTrace.width) },
       kind: "corner", length, trunkWidth: Math.max(firstWidth, secondWidth),
@@ -292,20 +349,50 @@ function buildCornerProfiles(
   return corners;
 }
 
+function boundedHermiteWidth(
+  t: number,
+  start: number,
+  end: number,
+  startSlope: number,
+  endSlope: number,
+  length: number,
+  minimum: number,
+  maximum: number,
+) {
+  let firstSlope = startSlope;
+  let secondSlope = endSlope;
+  const secant = (end - start) / Math.max(length, EPSILON);
+  if (Math.abs(secant) > EPSILON) {
+    if (firstSlope * secant < 0) firstSlope = 0;
+    if (secondSlope * secant < 0) secondSlope = 0;
+    const alpha = firstSlope / secant;
+    const beta = secondSlope / secant;
+    const magnitude = Math.hypot(alpha, beta);
+    if (magnitude > 3) {
+      const scale = 3 / magnitude;
+      firstSlope *= scale;
+      secondSlope *= scale;
+    }
+  }
+  const control1 = clamp(start + firstSlope * length / 3, minimum, maximum);
+  const control2 = clamp(end - secondSlope * length / 3, minimum, maximum);
+  const inverse = 1 - t;
+  return inverse ** 3 * start
+    + 3 * inverse * inverse * t * control1
+    + 3 * inverse * t * t * control2
+    + t ** 3 * end;
+}
+
 function protectedNode(point: Point, board: ParsedBoard) {
   return board.pads.some((pad) => isSupportedBackPad(pad) && pointInPolygon(point, padPolygon(pad)))
     || board.vias.some((via) => (via.layers.includes("B.Cu") || via.layers.includes("*.Cu"))
       && Math.hypot(point.x - via.position.x, point.y - via.position.y) <= via.size / 2 + EPSILON);
 }
 
-function effectiveTraceWidth(trace: Trace, settings: GeneratorSettings) {
-  return settings.width_mode === "preserve" ? trace.width : Math.max(trace.width, settings.trace_width);
-}
-
 function sameCircuit(first: Trace, second: Trace) {
-  const firstNet = first.net_id ?? null;
-  const secondNet = second.net_id ?? null;
-  return firstNet !== null && firstNet > 0 ? firstNet === secondNet : firstNet === null && secondNet === null;
+  const firstNet = positiveNetId(first.net_id);
+  const secondNet = positiveNetId(second.net_id);
+  return firstNet !== null ? firstNet === secondNet : secondNet === null;
 }
 
 export function padPolygon(pad: Pad): Point[] {
@@ -349,11 +436,15 @@ export function padExitDistance(pad: Pad, direction: Point, origin = pad.positio
 }
 
 function isTaperAttachment(trace: Trace, pad: Pad, endpoint: Point) {
-  const traceNet = trace.net_id ?? 0;
-  const padNet = pad.net_id ?? 0;
-  if (traceNet > 0 && traceNet === padNet) return pointInPolygon(endpoint, padPolygon(pad));
-  return trace.net_id == null && pad.net_id == null
+  const traceNet = positiveNetId(trace.net_id);
+  const padNet = positiveNetId(pad.net_id);
+  if (traceNet !== null && traceNet === padNet) return pointInPolygon(endpoint, padPolygon(pad));
+  return traceNet === null && padNet === null
     && Math.hypot(endpoint.x - pad.position.x, endpoint.y - pad.position.y) < LEGACY_ATTACHMENT_TOLERANCE;
+}
+
+function positiveNetId(value?: number | null) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
 }
 
 function matchingPadAttachment(trace: Trace, pads: Pad[], endpoint: Point, direction: Point) {
@@ -505,14 +596,6 @@ function arcPoints(center: Point, radius: number, start: number, end: number, st
   });
 }
 
-function quadratic(start: Point, control: Point, end: Point, t: number) {
-  const inverse = 1 - t;
-  return {
-    x: inverse * inverse * start.x + 2 * inverse * t * control.x + t * t * end.x,
-    y: inverse * inverse * start.y + 2 * inverse * t * control.y + t * t * end.y,
-  };
-}
-
 function cubicBezier(start: Point, control1: Point, control2: Point, end: Point, t: number) {
   const inverse = 1 - t;
   return {
@@ -530,25 +613,30 @@ function polygonArea(points: Point[]) {
   }, 0) / 2;
 }
 
-function quadraticMinimumRadius(start: Point, control: Point, end: Point) {
-  const first = { x: control.x - start.x, y: control.y - start.y };
-  const second = {
-    x: end.x - 2 * control.x + start.x,
-    y: end.y - 2 * control.y + start.y,
-  };
-  let minimum = Number.POSITIVE_INFINITY;
-  for (let index = 0; index <= 24; index += 1) {
-    const t = index / 24;
-    const derivative = {
-      x: 2 * (first.x + second.x * t),
-      y: 2 * (first.y + second.y * t),
-    };
-    const acceleration = { x: 2 * second.x, y: 2 * second.y };
-    const numerator = Math.pow(Math.hypot(derivative.x, derivative.y), 3);
-    const denominator = Math.abs(cross(derivative, acceleration));
-    if (denominator > EPSILON) minimum = Math.min(minimum, numerator / denominator);
-  }
-  return minimum;
+function circularFillet(
+  node: Point,
+  firstDirection: Point,
+  secondDirection: Point,
+  reach: number,
+  interior: number,
+) {
+  const halfInterior = interior / 2;
+  const sinHalf = Math.sin(halfInterior);
+  const bisectorVector = add(firstDirection, secondDirection);
+  const bisectorLength = Math.hypot(bisectorVector.x, bisectorVector.y);
+  if (reach <= EPSILON || sinHalf <= EPSILON || bisectorLength <= EPSILON) return null;
+
+  const radius = reach * Math.tan(halfInterior);
+  if (!Number.isFinite(radius) || radius <= EPSILON) return null;
+  const center = add(node, scale(bisectorVector, radius / (sinHalf * bisectorLength)));
+  const start = add(node, scale(firstDirection, reach));
+  const end = add(node, scale(secondDirection, reach));
+  const startRadius = { x: start.x - center.x, y: start.y - center.y };
+  const endRadius = { x: end.x - center.x, y: end.y - center.y };
+  const startAngle = Math.atan2(startRadius.y, startRadius.x);
+  const sweep = Math.atan2(cross(startRadius, endRadius), dot(startRadius, endRadius));
+  if (Math.abs(sweep) <= EPSILON) return null;
+  return { center, radius, start, end, startAngle, sweep };
 }
 
 function pointKey(point: Point) {
@@ -572,7 +660,6 @@ function smootherstep(value: number) {
 function add(a: Point, b: Point) { return { x: a.x + b.x, y: a.y + b.y }; }
 function scale(point: Point, value: number) { return { x: point.x * value, y: point.y * value }; }
 function dot(a: Point, b: Point) { return a.x * b.x + a.y * b.y; }
-function distance(a: Point, b: Point) { return Math.hypot(a.x - b.x, a.y - b.y); }
 function cross(a: Point, b: Point) { return a.x * b.y - a.y * b.x; }
 function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 

@@ -16,8 +16,8 @@ board and exports slicer-ready 3MF or STL files.
 - Automatically keeps configurable narrow neck-downs through through-hole pads,
   then tapers them into wider printable trunks after clearing the pad boundary.
 - Offers Technical, Soft, and Vintage trace styles. Soft uses zero-slope eased
-  tapers; Vintage adds monotonic tangent Bézier lobes at pads and tangent bends
-  at safe, unbranched same-net corners.
+  tapers; Vintage adds monotonic tangent Bézier lobes at pads and constant-radius
+  tangent fillets at safe, unbranched same-net corners.
 - Preserves KiCad's cached filled `B.Cu` zone polygons exactly, including
   thermal reliefs, islands, and keepout-shaped voids. Unfilled back-copper zones
   block export with a request to refill and save them in KiCad.
@@ -30,7 +30,9 @@ board and exports slicer-ready 3MF or STL files.
 - Retains KiCad net identity, permits same-net joins, and marks detected
   different-net trace, pad, via, and filled-zone clearance conflicts in the
   preview.
-- Exports 3MF, binary STL, and a reopenable `.copperline.json` project.
+- Prepares deterministic 3MF and binary STL artifacts after each geometry
+  change so export clicks are immediate, repeatable, and snapshot-safe; also
+  saves a reopenable `.copperline.json` project.
 - Stores a device-local preferred slicer and offers a separate 3MF handoff;
   browsers without native file sharing fall back to a normal download.
 - Keeps board files and generated geometry in the browser.

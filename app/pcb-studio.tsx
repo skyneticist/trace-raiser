@@ -13,11 +13,15 @@ import {
   GeneratorSettings,
   ParsedBoard,
   generateStl,
+  normalizeParsedBoard,
   parseKicad,
 } from "./lib/pcb-core";
 import { stlTo3mf } from "./lib/three-mf";
+import { downloadBytes } from "./lib/browser-download";
 import { buildTraceProfiles, traceProfilePolygons, type TraceProfile } from "./lib/manufacturing-geometry";
 import { findClearanceConflicts, type ClearanceConflict } from "./lib/printability";
+import { createPreviewProjection, RELIEF_Z_EXAGGERATION } from "./lib/preview-projection";
+import { modelExportDisabledReason, summarizePrintabilityIssues } from "./lib/export-readiness";
 import { DEFAULT_SETTINGS, normalizeSettings, type SavedGeneratorSettings } from "./lib/settings";
 import {
   SLICER_OPTIONS,
@@ -33,7 +37,27 @@ import {
 
 type ViewMode = "angled" | "top";
 type ExportKind = "stl" | "3mf";
-type WorkspacePanel = "source" | "shape" | "check" | "export";
+type ThemeMode = "light" | "dim";
+type PreparedModel = {
+  stl: Uint8Array;
+  threeMf: Uint8Array;
+  file: File | null;
+  stem: string;
+};
+type ExportSnapshot = {
+  board: ParsedBoard;
+  settings: GeneratorSettings;
+  sourceName: string;
+  retry: number;
+};
+type ExportPreparation =
+  | { phase: "idle" }
+  | { phase: "preparing"; snapshot: ExportSnapshot }
+  | { phase: "ready"; snapshot: ExportSnapshot; prepared: PreparedModel }
+  | { phase: "error"; snapshot: ExportSnapshot; message: string };
+const THEME_PREFERENCE_KEY = "copperline-theme";
+const EXPORT_PREPARATION_DELAY_MS = 160;
+const DELIVERY_LOCK_MS = 700;
 type ProjectFile = {
   format: "copperline-project";
   version: 1;
@@ -48,14 +72,18 @@ export default function CopperlineStudio() {
   const [sourceName, setSourceName] = useState("sample-sensor.kicad_pcb");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [viewMode, setViewMode] = useState<ViewMode>("top");
-  const [activePanel, setActivePanel] = useState<WorkspacePanel | null>(null);
+  const [theme, setTheme] = useState<ThemeMode>("light");
   const [preferredSlicer, setPreferredSlicer] = useState<SlicerPreference>("bambu");
   const [status, setStatus] = useState("Starting the geometry engine…");
   const [busy, setBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [showGuidance, setShowGuidance] = useState(false);
-  const [showAllWarnings, setShowAllWarnings] = useState(false);
+  const [exportPreparation, setExportPreparation] = useState<ExportPreparation>({ phase: "idle" });
+  const [exportRetry, setExportRetry] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const preparationRevisionRef = useRef(0);
+  const deliveryLockRef = useRef<number | null>(null);
+  const deliverySequenceRef = useRef(0);
 
   const loadKicadText = useCallback(async (text: string, name: string) => {
     setBusy(true);
@@ -91,6 +119,7 @@ export default function CopperlineStudio() {
     const timer = window.setTimeout(() => {
       try {
         setPreferredSlicer(normalizeSlicerPreference(window.localStorage.getItem(SLICER_PREFERENCE_KEY)));
+        if (window.localStorage.getItem(THEME_PREFERENCE_KEY) === "dim") setTheme("dim");
       } catch {
         // Device-local preferences are optional when storage is unavailable.
       }
@@ -98,13 +127,17 @@ export default function CopperlineStudio() {
     return () => window.clearTimeout(timer);
   }, []);
 
-  useEffect(() => {
-    const closeDrawer = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setActivePanel(null);
-    };
-    window.addEventListener("keydown", closeDrawer);
-    return () => window.removeEventListener("keydown", closeDrawer);
-  }, []);
+  const toggleTheme = () => {
+    setTheme((current) => {
+      const next = current === "light" ? "dim" : "light";
+      try {
+        window.localStorage.setItem(THEME_PREFERENCE_KEY, next);
+      } catch {
+        // The visual preference remains usable for this session without storage.
+      }
+      return next;
+    });
+  };
 
   const importFile = useCallback(
     async (file: File) => {
@@ -120,7 +153,7 @@ export default function CopperlineStudio() {
           if (project.format !== "copperline-project" || !project.board) {
             throw new Error("This is not a Copperline project file.");
           }
-          setBoard(project.board);
+          setBoard(normalizeParsedBoard(project.board));
           // Any imported project is legacy-compatible. A missing settings
           // object must not opt an older project into newly generated styling.
           setSettings(normalizeSettings(project.settings ?? {}));
@@ -172,6 +205,16 @@ export default function CopperlineStudio() {
   );
 
   const layerTraceCount = backTraces.length;
+  const profileSummary = settings.width_mode === "preserve"
+    ? "Preserve KiCad"
+    : `${traceStyleLabel(settings.trace_style)} · Auto`;
+  const widthSummary = settings.width_mode === "preserve"
+    ? "Authored per trace"
+    : `${settings.trace_width.toFixed(1)} / ${settings.neckdown_width.toFixed(1)} mm`;
+  const modelSizeSummary = board
+    ? `${board.bounds.width.toFixed(1)} × ${board.bounds.height.toFixed(1)} × ${(settings.board_thickness + settings.trace_height).toFixed(2)} mm`
+    : "—";
+  const verticalStackSummary = `${settings.board_thickness.toFixed(2)} + ${settings.trace_height.toFixed(2)} mm`;
 
   const unsupportedPadCount = useMemo(
     () => backPads.filter(isUnsupportedCopperPad).length,
@@ -183,7 +226,7 @@ export default function CopperlineStudio() {
     [board, settings],
   );
 
-  const printableWarnings = useMemo(() => {
+  const printabilityIssues = useMemo(() => {
     if (!board) return [];
     const warnings = board.warnings.filter(
       (warning) => !["UNSUPPORTED_SMD_PAD", "UNSUPPORTED_CUSTOM_PAD"].includes(warning.code),
@@ -204,43 +247,139 @@ export default function CopperlineStudio() {
     }
     if (clearanceConflicts.length > 0) {
       const tracePairs = clearanceConflicts.filter((conflict) => conflict.kind === "trace-trace").length;
+      const netlessPairs = clearanceConflicts.filter(
+        (conflict) => conflict.firstNet === null || conflict.secondNet === null,
+      ).length;
       const first = clearanceConflicts[0];
       const firstNets = `${netLabel(first.firstNetName, first.firstNet)} ↔ ${netLabel(first.secondNetName, first.secondNet)}`;
       warnings.unshift({
         code: "clearance-conflicts",
         severity: "error" as const,
-        message: `${clearanceConflicts.length} different-net clearance ${clearanceConflicts.length === 1 ? "conflict is" : "conflicts are"} marked in red (${tracePairs} trace-to-trace). First: ${firstNets}, ${first.gap.toFixed(2)} mm measured vs ${first.requiredClearance.toFixed(2)} mm required.`,
+        message: `${clearanceConflicts.length} copper clearance ${clearanceConflicts.length === 1 ? "conflict is" : "conflicts are"} marked in red (${tracePairs} trace-to-trace${netlessPairs ? `; ${netlessPairs} involve unassigned nets` : ""}). First: ${firstNets}, ${first.gap.toFixed(2)} mm measured vs ${first.requiredClearance.toFixed(2)} mm required.`,
       });
     }
     return warnings;
   }, [board, clearanceConflicts, layerTraceCount, unsupportedPadCount]);
 
-  const exportBlocked = printableWarnings.some((warning) => warning.severity === "error");
-  const blockingErrorCount = printableWarnings.filter(
-    (warning) => warning.severity === "error",
-  ).length;
+  const {
+    blockerCount: blockingErrorCount,
+    warningCount: nonBlockingWarningCount,
+    orderedIssues: printableWarnings,
+    firstBlocker,
+  } = useMemo(() => summarizePrintabilityIssues(printabilityIssues), [printabilityIssues]);
+  const exportBlocked = blockingErrorCount > 0;
+  const eligibilityReason = modelExportDisabledReason(Boolean(board), busy, blockingErrorCount);
+
+  useEffect(() => {
+    const revision = ++preparationRevisionRef.current;
+
+    if (!board || busy || exportBlocked) {
+      return;
+    }
+
+    const snapshot = { board, settings, sourceName, retry: exportRetry };
+    const timer = window.setTimeout(() => {
+      if (revision !== preparationRevisionRef.current) return;
+      setExportPreparation({ phase: "preparing", snapshot });
+      setStatus("Preparing verified export files locally…");
+      const stem = cleanName(sourceName);
+
+      void generateStl(board, settings)
+        .then((stl) => {
+          if (revision !== preparationRevisionRef.current) return;
+          const threeMf = stlTo3mf(stl, stem);
+          if (revision !== preparationRevisionRef.current) return;
+          let file: File | null = null;
+          if (typeof File === "function") {
+            try {
+              file = new File([threeMf as BlobPart], `${stem}-back-copper.3mf`, { type: "model/3mf" });
+            } catch {
+              file = null;
+            }
+          }
+          setExportPreparation({
+            phase: "ready",
+            snapshot,
+            prepared: { stl, threeMf, file, stem },
+          });
+          setStatus("Verified STL and 3MF files are prepared locally.");
+        })
+        .catch((error) => {
+          if (revision !== preparationRevisionRef.current) return;
+          const message = error instanceof Error ? error.message : "The printable model could not be prepared.";
+          setExportPreparation({ phase: "error", snapshot, message });
+          setStatus(message);
+        });
+    }, EXPORT_PREPARATION_DELAY_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (preparationRevisionRef.current === revision) preparationRevisionRef.current += 1;
+    };
+  }, [board, busy, exportBlocked, exportRetry, settings, sourceName]);
+
+  const currentPreparation = exportPreparation.phase !== "idle"
+    && exportPreparation.snapshot.board === board
+    && exportPreparation.snapshot.settings === settings
+    && exportPreparation.snapshot.sourceName === sourceName
+    && exportPreparation.snapshot.retry === exportRetry
+    ? exportPreparation
+    : null;
+  const preparationPhase = currentPreparation?.phase
+    ?? (!eligibilityReason ? "debouncing" : "idle");
+  const preparedModel = currentPreparation?.phase === "ready"
+    ? currentPreparation.prepared
+    : null;
+  const modelReady = !eligibilityReason
+    && preparationPhase === "ready"
+    && preparedModel !== null;
+  const exportDisabledReason = eligibilityReason
+    ?? (preparationPhase === "error"
+      ? "Export preparation failed."
+      : modelReady
+        ? null
+        : "Preparing verified export files…");
+  const exportReadinessState = exportBlocked || preparationPhase === "error"
+    ? "is-blocked"
+    : exportDisabledReason
+      ? "is-pending"
+      : "is-ready";
 
   const displayedStatus = !busy && board && blockingErrorCount > 0
     ? `${blockingErrorCount} printability ${blockingErrorCount === 1 ? "error blocks" : "errors block"} export.`
     : status;
 
-  const exportModel = async (kind: ExportKind) => {
-    if (!board || busy || exportBlocked) return;
-    setBusy(true);
-    setStatus(`Generating ${kind.toUpperCase()} locally…`);
+  const acquireDelivery = () => {
+    if (deliveryLockRef.current !== null) {
+      setStatus("The previous export request is already being handled.");
+      return false;
+    }
+    const token = ++deliverySequenceRef.current;
+    deliveryLockRef.current = token;
+    window.setTimeout(() => {
+      if (deliveryLockRef.current === token) deliveryLockRef.current = null;
+    }, DELIVERY_LOCK_MS);
+    return true;
+  };
+
+  const releaseDelivery = () => {
+    deliveryLockRef.current = null;
+  };
+
+  const exportModel = (kind: ExportKind) => {
+    const prepared = preparedModel;
+    if (!modelReady || !prepared || !acquireDelivery()) return;
     try {
-      const stl = await generateStl(board, settings);
-      const model = kind === "3mf" ? stlTo3mf(stl, cleanName(sourceName)) : stl;
-      downloadBlob(
+      const model = kind === "3mf" ? prepared.threeMf : prepared.stl;
+      downloadBytes(
         model,
-        `${cleanName(sourceName)}-back-copper.${kind}`,
+        `${prepared.stem}-back-copper.${kind}`,
         kind === "3mf" ? "model/3mf" : "model/stl",
       );
-      setStatus(`${kind.toUpperCase()} generated. Review it in your slicer before printing.`);
+      setStatus(`${kind.toUpperCase()} download requested from the browser. Review it in your slicer before printing.`);
     } catch (error) {
+      releaseDelivery();
       setStatus(error instanceof Error ? error.message : "The model could not be generated.");
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -253,23 +392,13 @@ export default function CopperlineStudio() {
     }
   };
 
-  const handoffToSlicer = async () => {
-    if (!board || busy || exportBlocked) return;
+  const handoffToSlicer = () => {
+    const prepared = preparedModel;
+    if (!modelReady || !prepared || !acquireDelivery()) return;
     const selected = slicerOption(preferredSlicer);
-    setBusy(true);
-    setStatus(`Preparing a 3MF for ${selected.handoffLabel}…`);
+    const fileName = `${prepared.stem}-back-copper.3mf`;
+    const file = prepared.file;
     try {
-      const stl = await generateStl(board, settings);
-      const model = stlTo3mf(stl, cleanName(sourceName));
-      const fileName = `${cleanName(sourceName)}-back-copper.3mf`;
-      let file: File | null = null;
-      if (typeof File === "function") {
-        try {
-          file = new File([model as BlobPart], fileName, { type: "model/3mf" });
-        } catch {
-          file = null;
-        }
-      }
       const shareAvailable = typeof navigator.share === "function";
       let canShareFile = false;
       if (file && shareAvailable && typeof navigator.canShare === "function") {
@@ -281,33 +410,34 @@ export default function CopperlineStudio() {
       }
 
       if (file && decideSlicerHandoff(shareAvailable, canShareFile) === "share") {
-        try {
-          await navigator.share({
-            files: [file],
-            title: fileName,
-            text: `3MF prepared for ${selected.handoffLabel}`,
-          });
+        // Call share synchronously in the click task. Awaiting generation first
+        // loses the transient user activation required by Web Share.
+        void navigator.share({
+          files: [file],
+          title: fileName,
+          text: `3MF prepared for ${selected.handoffLabel}`,
+        }).then(() => {
           setStatus(`3MF shared. Choose ${selected.handoffLabel} if it is offered, then review the model before printing.`);
-          return;
-        } catch (error) {
+        }).catch((error) => {
           if (isCanceledShareError(error)) {
             setStatus("Sharing canceled. No file was downloaded.");
-            return;
+          } else {
+            setStatus("The system share sheet did not accept the 3MF. Use Download 3MF instead.");
           }
-        }
+        });
+        return;
       }
 
-      downloadBlob(model, fileName, "model/3mf");
+      downloadBytes(prepared.threeMf, fileName, "model/3mf");
       setStatus(slicerFallbackMessage(preferredSlicer));
     } catch (error) {
+      releaseDelivery();
       setStatus(error instanceof Error ? error.message : "The 3MF could not be prepared.");
-    } finally {
-      setBusy(false);
     }
   };
 
   const exportProject = () => {
-    if (!board) return;
+    if (!board || !acquireDelivery()) return;
     const project: ProjectFile = {
       format: "copperline-project",
       version: 1,
@@ -316,16 +446,21 @@ export default function CopperlineStudio() {
       board,
       settings,
     };
-    downloadBlob(
-      new TextEncoder().encode(JSON.stringify(project, null, 2)),
-      `${cleanName(sourceName)}.copperline.json`,
-      "application/json",
-    );
-    setStatus("Editable Copperline project saved.");
+    try {
+      downloadBytes(
+        new TextEncoder().encode(JSON.stringify(project, null, 2)),
+        `${cleanName(sourceName)}.copperline.json`,
+        "application/json",
+      );
+      setStatus("Editable Copperline project download started.");
+    } catch (error) {
+      releaseDelivery();
+      setStatus(error instanceof Error ? error.message : "The editable project download could not be started.");
+    }
   };
 
   return (
-    <main className="studio-shell">
+    <main className="studio-shell" data-theme={theme}>
       <header className="topbar">
         <div className="brand" aria-label="Copperline Studio">
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
@@ -339,46 +474,29 @@ export default function CopperlineStudio() {
           <span className="workspace-divider" aria-hidden="true" />
           <span className="output-side">B.Cu output</span>
         </div>
-        <button
-          type="button"
-          className={`topbar-export ${exportBlocked ? "has-errors" : ""}`}
-          onClick={() => setActivePanel("export")}
-          aria-controls="workspace-drawer"
-          aria-expanded={activePanel === "export"}
-        >
-          <span>{exportBlocked ? `${blockingErrorCount} blockers` : "Export"}</span>
-          <b aria-hidden="true">→</b>
-        </button>
+        <div className="header-actions">
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            aria-label={`Switch to ${theme === "light" ? "dim" : "light"} theme`}
+            aria-pressed={theme === "dim"}
+            title={`Use ${theme === "light" ? "dim" : "light"} theme`}
+          >
+            <span aria-hidden="true">{theme === "light" ? "◐" : "○"}</span>
+            {theme === "light" ? "Dim" : "Light"}
+          </button>
+        </div>
       </header>
 
-      <section className={`workspace ${activePanel ? "has-drawer" : ""}`} aria-label="PCB model workspace">
-        <nav className="workflow-rail" aria-label="Workspace tools">
-          <button type="button" aria-pressed={activePanel === "source"} aria-controls="workspace-drawer" aria-expanded={activePanel === "source"} className={activePanel === "source" ? "active" : ""} onClick={() => setActivePanel((current) => current === "source" ? null : "source")}>
-            <span aria-hidden="true">↑</span><small>Source</small>
-          </button>
-          <button type="button" aria-pressed={activePanel === "shape"} aria-controls="workspace-drawer" aria-expanded={activePanel === "shape"} className={activePanel === "shape" ? "active" : ""} onClick={() => setActivePanel((current) => current === "shape" ? null : "shape")}>
-            <span aria-hidden="true">≈</span><small>Shape</small>
-          </button>
-          <button type="button" aria-pressed={activePanel === "check"} aria-controls="workspace-drawer" aria-expanded={activePanel === "check"} className={activePanel === "check" ? "active" : ""} onClick={() => setActivePanel((current) => current === "check" ? null : "check")}>
-            <span aria-hidden="true">✓</span><small>Check</small>
-            {printableWarnings.length > 0 && <i aria-hidden="true">{printableWarnings.length}</i>}
-          </button>
-          <button type="button" aria-pressed={activePanel === "export"} aria-controls="workspace-drawer" aria-expanded={activePanel === "export"} className={activePanel === "export" ? "active" : ""} onClick={() => setActivePanel((current) => current === "export" ? null : "export")}>
-            <span aria-hidden="true">↓</span><small>Export</small>
-          </button>
-        </nav>
-
-        {activePanel && <button type="button" className="drawer-backdrop" aria-hidden="true" tabIndex={-1} onClick={() => setActivePanel(null)} />}
-
-        {(activePanel === "source" || activePanel === "shape") && (
-        <aside id="workspace-drawer" className="context-drawer" aria-label={activePanel === "source" ? "Source board" : "Shape controls"}>
-          <button type="button" className="drawer-close" aria-label="Close panel" onClick={() => setActivePanel(null)}>×</button>
-          {activePanel === "source" && <section className="side-section source-section" aria-labelledby="source-heading">
+      <section className="workspace" aria-label="PCB model workspace">
+        <aside className="controls-pane" aria-label="Source and shaping controls">
+          <section className="side-section panel-card source-section" aria-labelledby="source-heading">
             <div className="section-heading">
               <span className="section-index">01</span>
               <div>
                 <h1 id="source-heading">Source board</h1>
-                <p>From copper paths to printable form. Files stay in this browser.</p>
+                <p>Choose a routed board. Files stay in this browser.</p>
               </div>
             </div>
 
@@ -406,14 +524,14 @@ export default function CopperlineStudio() {
             <button type="button" className="sample-button" onClick={() => void loadSample()} disabled={busy}>
               Reload sample board <span>→</span>
             </button>
-          </section>}
+          </section>
 
-          {activePanel === "shape" && <section className="side-section build-section" aria-labelledby="build-heading">
+          <section className="side-section build-section" aria-labelledby="build-heading">
             <div className="section-heading build-heading-row">
               <span className="section-index">02</span>
               <div>
                 <h2 id="build-heading">Build setup</h2>
-                <p>All geometry controls remain available below.</p>
+                <p>Shape the printable board and routed copper.</p>
               </div>
               <button
                 type="button"
@@ -426,151 +544,157 @@ export default function CopperlineStudio() {
             </div>
 
             <div className="constraint-row" role="note">
-              <span>Back copper only</span>
-              <strong>B.Cu · mirrored</strong>
+              <span>Output layer</span>
+              <strong>B.Cu · mirrored · local</strong>
             </div>
 
-            <div className="parameter-group">
-              <h3>Board</h3>
-              <Parameter
-                label="Board thickness"
-                helper="The thickness of the printed plastic board beneath the raised traces."
-                showHelper={showGuidance}
-                value={settings.board_thickness}
-                min={0.8}
-                max={3}
-                step={0.1}
-                unit="mm"
-                onChange={(value) => updateSetting("board_thickness", value)}
-              />
-            </div>
+            <section className="control-group form-group" aria-labelledby="form-settings-heading">
+              <h3 id="form-settings-heading"><span>Form</span><small>Printed substrate</small></h3>
+              <div className="settings-grid">
+                <Parameter
+                  label="Board thickness"
+                  helper="The thickness of the printed plastic board beneath the raised traces."
+                  showHelper={showGuidance}
+                  value={settings.board_thickness}
+                  min={0.8}
+                  max={3}
+                  step={0.1}
+                  unit="mm"
+                  onChange={(value) => updateSetting("board_thickness", value)}
+                />
+                <Parameter
+                  label="Trace height"
+                  helper="How far each trace stands above the board so copper tape can be pressed and trimmed."
+                  showHelper={showGuidance}
+                  value={settings.trace_height}
+                  min={0.2}
+                  max={1.4}
+                  step={0.05}
+                  unit="mm"
+                  onChange={(value) => updateSetting("trace_height", value)}
+                />
+                <Parameter
+                  label="Hole compensation"
+                  helper="Adds a little diameter to drilled holes to offset FDM shrinkage and printer tolerance."
+                  showHelper={showGuidance}
+                  value={settings.hole_compensation}
+                  min={0}
+                  max={0.6}
+                  step={0.02}
+                  unit="mm"
+                  onChange={(value) => updateSetting("hole_compensation", value)}
+                />
+              </div>
+            </section>
 
-            <div className="parameter-group">
-              <h3>Trace geometry</h3>
-              <WidthModeControl value={settings.width_mode} onChange={(value) => updateSetting("width_mode", value)} showHelper={showGuidance} />
-              <Parameter
-                label="Trace height"
-                helper="How far each trace stands above the board so copper tape can be pressed and trimmed."
-                showHelper={showGuidance}
-                value={settings.trace_height}
-                min={0.2}
-                max={1.4}
-                step={0.05}
-                unit="mm"
-                onChange={(value) => updateSetting("trace_height", value)}
-              />
-              {settings.width_mode === "auto" ? (
-                <>
-                  <TraceStyleControl
-                    value={settings.trace_style}
-                    onChange={(value) => updateSetting("trace_style", value)}
-                    showHelper={showGuidance}
-                  />
+            <section className="control-group" aria-labelledby="routing-settings-heading">
+              <h3 id="routing-settings-heading"><span>Routing</span><small>Widths and transitions</small></h3>
+              <div className="settings-grid">
+                <div className="settings-span">
+                <WidthModeControl value={settings.width_mode} onChange={(value) => updateSetting("width_mode", value)} showHelper={showGuidance} />
+                </div>
+                {settings.width_mode === "auto" ? (
+                  <>
+                    <div className="settings-span">
+                      <TraceStyleControl
+                        value={settings.trace_style}
+                        onChange={(value) => updateSetting("trace_style", value)}
+                        showHelper={showGuidance}
+                      />
+                    </div>
+                    <Parameter
+                      label="Trunk width"
+                      helper="The broad printable width away from pads. Wider KiCad routes remain wider."
+                      showHelper={showGuidance}
+                      value={settings.trace_width}
+                      min={1.2}
+                      max={4}
+                      step={0.1}
+                      unit="mm"
+                      onChange={(value) => setSettings((current) => ({ ...current, trace_width: value, neckdown_width: Math.min(current.neckdown_width, value) }))}
+                    />
+                    <Parameter
+                      label="Neck-down width"
+                      helper="The narrow width through a through-hole pad, keeping crowded pad exits separated."
+                      showHelper={showGuidance}
+                      value={settings.neckdown_width}
+                      min={0.8}
+                      max={settings.trace_width}
+                      step={0.1}
+                      unit="mm"
+                      onChange={(value) => updateSetting("neckdown_width", value)}
+                    />
+                    <Parameter
+                      label="Taper length"
+                      helper="How far after the pad edge the narrow exit takes to widen into the trunk. Soft and Vintage styles use a zero-slope eased transition."
+                      showHelper={showGuidance}
+                      value={settings.taper_length}
+                      min={0.5}
+                      max={12}
+                      step={0.5}
+                      unit="mm"
+                      onChange={(value) => updateSetting("taper_length", value)}
+                    />
+                    <Parameter
+                      label="Clearance"
+                      helper="The required edge-to-edge gap between copper features on different electrical nets."
+                      showHelper={showGuidance}
+                      value={settings.trace_clearance}
+                      min={0}
+                      max={2}
+                      step={0.1}
+                      unit="mm"
+                      onChange={(value) => updateSetting("trace_clearance", value)}
+                    />
+                  </>
+                ) : (
+                  <div className="preserve-note settings-span">Uses the widths and routed paths authored in KiCad. Generated tapers, teardrops, and corner shaping are paused.</div>
+                )}
+              </div>
+            </section>
+
+            {settings.width_mode === "auto" && settings.trace_style === "vintage" && (
+              <section className="control-group vintage-group" aria-labelledby="vintage-settings-heading">
+                <h3 id="vintage-settings-heading"><span>Vintage profile</span><small>Organic trace shaping</small></h3>
+                <div className="vintage-grid">
                   <Parameter
-                    label="Trunk width"
-                    helper="The broad printable width away from pads. Wider KiCad routes remain wider."
+                    label="Corner radius"
+                    helper="Target centerline radius for circular corner fillets. Short segments reduce the radius, and unsafe bends remain unchanged."
                     showHelper={showGuidance}
-                    value={settings.trace_width}
-                    min={1.2}
-                    max={4}
-                    step={0.1}
-                    unit="mm"
-                    onChange={(value) => setSettings((current) => ({ ...current, trace_width: value, neckdown_width: Math.min(current.neckdown_width, value) }))}
-                  />
-                  <Parameter
-                    label="Neck-down width"
-                    helper="The narrow width through a through-hole pad, keeping crowded pad exits separated."
-                    showHelper={showGuidance}
-                    value={settings.neckdown_width}
-                    min={0.8}
-                    max={settings.trace_width}
-                    step={0.1}
-                    unit="mm"
-                    onChange={(value) => updateSetting("neckdown_width", value)}
-                  />
-                  <Parameter
-                    label="Taper length"
-                    helper="How far after the pad edge the narrow exit takes to widen into the trunk. Soft and Vintage styles use a zero-slope eased transition."
-                    showHelper={showGuidance}
-                    value={settings.taper_length}
+                    value={settings.corner_radius}
                     min={0.5}
                     max={12}
                     step={0.5}
                     unit="mm"
-                    onChange={(value) => updateSetting("taper_length", value)}
+                    onChange={(value) => updateSetting("corner_radius", value)}
                   />
-                  {settings.trace_style === "vintage" && (
-                    <details className="shape-details">
-                      <summary>Vintage shaping</summary>
-                      <Parameter
-                        label="Corner radius"
-                        helper="Target reach of tangent corner bends. Tight turns are reduced or left unchanged; clearance checks block unsafe bends."
-                        showHelper={showGuidance}
-                        value={settings.corner_radius}
-                        min={0.5}
-                        max={12}
-                        step={0.5}
-                        unit="mm"
-                        onChange={(value) => updateSetting("corner_radius", value)}
-                      />
-                      <Parameter
-                        label="Teardrop length"
-                        helper="How far a pad shoulder blends into its routed trace before the normal taper takes over."
-                        showHelper={showGuidance}
-                        value={settings.teardrop_length}
-                        min={0.5}
-                        max={10}
-                        step={0.5}
-                        unit="mm"
-                        onChange={(value) => updateSetting("teardrop_length", value)}
-                      />
-                      <Parameter
-                        label="Teardrop width"
-                        helper="How much of the available pad shoulder is used. The shoulder never grows beyond the supported pad copper."
-                        showHelper={showGuidance}
-                        value={settings.teardrop_strength * 100}
-                        min={0}
-                        max={100}
-                        step={5}
-                        unit="%"
-                        onChange={(value) => updateSetting("teardrop_strength", value / 100)}
-                      />
-                    </details>
-                  )}
-                </>
-              ) : (
-                <div className="preserve-note">Uses the widths and routed paths authored in KiCad. Generated tapers, teardrops, and corner shaping are paused.</div>
-              )}
-              <Parameter
-                label="Clearance"
-                helper="The required edge-to-edge gap between copper features on different electrical nets."
-                showHelper={showGuidance}
-                value={settings.trace_clearance}
-                min={0}
-                max={2}
-                step={0.1}
-                unit="mm"
-                onChange={(value) => updateSetting("trace_clearance", value)}
-              />
-            </div>
-
-            <div className="parameter-group">
-              <h3>Printer fit</h3>
-              <Parameter
-                label="Hole compensation"
-                helper="Adds a little diameter to drilled holes to offset FDM shrinkage and printer tolerance."
-                showHelper={showGuidance}
-                value={settings.hole_compensation}
-                min={0}
-                max={0.6}
-                step={0.02}
-                unit="mm"
-                onChange={(value) => updateSetting("hole_compensation", value)}
-              />
-            </div>
-          </section>}
+                  <Parameter
+                    label="Teardrop length"
+                    helper="How far a pad shoulder blends into its routed trace."
+                    showHelper={showGuidance}
+                    value={settings.teardrop_length}
+                    min={0.5}
+                    max={10}
+                    step={0.5}
+                    unit="mm"
+                    onChange={(value) => updateSetting("teardrop_length", value)}
+                  />
+                  <Parameter
+                    label="Teardrop width"
+                    helper="How much of the available pad shoulder is used."
+                    showHelper={showGuidance}
+                    value={settings.teardrop_strength * 100}
+                    min={0}
+                    max={100}
+                    step={5}
+                    unit="%"
+                    onChange={(value) => updateSetting("teardrop_strength", value / 100)}
+                  />
+                </div>
+              </section>
+            )}
+          </section>
         </aside>
-        )}
 
         <section className="preview-panel">
           <div className="preview-toolbar">
@@ -579,137 +703,173 @@ export default function CopperlineStudio() {
               <strong title={sourceName}>{sourceName}</strong>
             </div>
             <div className="view-switch" role="group" aria-label="Preview angle">
-              <button aria-pressed={viewMode === "angled"} className={viewMode === "angled" ? "active" : ""} onClick={() => setViewMode("angled")}>RELIEF</button>
+              <button
+                aria-pressed={viewMode === "angled"}
+                className={viewMode === "angled" ? "active" : ""}
+                title={`Raised form preview with ${RELIEF_Z_EXAGGERATION}× vertical emphasis`}
+                onClick={() => setViewMode("angled")}
+              >RELIEF</button>
               <button aria-pressed={viewMode === "top"} className={viewMode === "top" ? "active" : ""} onClick={() => setViewMode("top")}>TOP</button>
             </div>
           </div>
 
-          <BoardCanvas board={board} settings={settings} viewMode={viewMode} conflicts={clearanceConflicts} />
+          <BoardCanvas board={board} settings={settings} viewMode={viewMode} conflicts={clearanceConflicts} theme={theme} />
 
           {clearanceConflicts.length > 0 && (
             <div className="conflict-legend" role="status"><span /> {clearanceConflicts.length} marked conflict {clearanceConflicts.length === 1 ? "location" : "locations"}</div>
           )}
 
-          <button
-            type="button"
+          <div
             className={`validation-bar ${blockingErrorCount ? "has-errors" : printableWarnings.length ? "has-warnings" : "is-pass"} ${busy ? "is-busy" : ""}`}
-            onClick={() => setActivePanel("check")}
-            aria-label={`${displayedStatus} Open board checks.`}
-            aria-controls="workspace-drawer"
-            aria-expanded={activePanel === "check"}
+            role="status"
+            aria-live="polite"
           >
-            <span className="validation-summary"><i className="status-dot" />{displayedStatus}</span>
-            <strong>{blockingErrorCount ? `${blockingErrorCount} ${blockingErrorCount === 1 ? "blocker" : "blockers"}` : printableWarnings.length ? `${printableWarnings.length} ${printableWarnings.length === 1 ? "warning" : "warnings"}` : "PASS"}<b aria-hidden="true">›</b></strong>
-          </button>
+            <span className="validation-summary"><i className="status-dot" /><span>{displayedStatus}</span></span>
+            <strong>{blockingErrorCount ? `${blockingErrorCount} ${blockingErrorCount === 1 ? "blocker" : "blockers"}` : printableWarnings.length ? `${printableWarnings.length} ${printableWarnings.length === 1 ? "warning" : "warnings"}` : "PASS"}</strong>
+          </div>
         </section>
 
-        {(activePanel === "check" || activePanel === "export") && (
-        <aside id="workspace-drawer" className="context-drawer report-drawer" aria-label={activePanel === "check" ? "Board report" : "Export options"}>
-          <button type="button" className="drawer-close" aria-label="Close panel" onClick={() => setActivePanel(null)}>×</button>
-          {activePanel === "check" && <>
-          <div className="section-heading inspect-heading">
-            <span className="section-index">03</span>
-            <div>
-              <h2>Board report</h2>
-              <p>Geometry and export readiness.</p>
+        <aside className="output-pane" aria-label="Board checks and export options">
+          <section className="panel-card report-section" aria-labelledby="report-heading">
+            <div className="section-heading inspect-heading">
+              <span className="section-index">03</span>
+              <div>
+                <h2 id="report-heading">Board report</h2>
+                <p>Geometry and export readiness.</p>
+              </div>
             </div>
-          </div>
-          <div className="board-measure">
-            <span>BOARD SIZE</span>
-            <strong>{board ? `${board.bounds.width.toFixed(1)} × ${board.bounds.height.toFixed(1)}` : "—"}</strong>
-            <small>millimeters</small>
-          </div>
+            <div className="board-summary">
+              <div className="board-measure">
+                <span>BOARD SIZE</span>
+                <strong>{board ? `${board.bounds.width.toFixed(1)} × ${board.bounds.height.toFixed(1)}` : "—"}</strong>
+                <small>millimeters</small>
+              </div>
 
-          <div className="stat-grid">
-            <Stat label="Trace segments" value={layerTraceCount} />
-            <Stat label="B.Cu pads" value={backPads.length} />
-            <Stat label="Holes" value={board?.stats.holes ?? 0} />
-            <Stat label="Vias" value={board?.stats.vias ?? 0} />
-            <Stat label="B.Cu zones" value={backZones.length} />
-            <Stat label="Zone fills" value={backZones.reduce((total, zone) => total + zone.polygons.length, 0)} />
-          </div>
-
-          <div className="check-header">
-            <span>PRINTABILITY</span>
-            <span className={printableWarnings.length ? "check-count warning" : "check-count"}>
-              {printableWarnings.length || "PASS"}
-            </span>
-          </div>
-
-          <div className="warning-list">
-            {!board ? (
-              <div className="empty-check">Load a board to run geometry checks.</div>
-            ) : printableWarnings.length === 0 ? (
-              <div className="pass-check"><span>✓</span><div><strong>Ready to form</strong><small>No known printability blockers.</small></div></div>
-            ) : (
-              (showAllWarnings ? printableWarnings : printableWarnings.slice(0, 4)).map((warning, index) => (
-                <div className={`warning-item ${warning.severity}`} key={`${warning.code}-${index}`}>
-                  <span>{warning.severity === "error" ? "!" : index + 1}</span>
-                  <p>{warning.message}</p>
-                </div>
-              ))
-            )}
-            {printableWarnings.length > 4 && (
-              <button type="button" className="warning-toggle" onClick={() => setShowAllWarnings((current) => !current)}>
-                {showAllWarnings ? "Show first four" : `Show all ${printableWarnings.length}`}
-              </button>
-            )}
-          </div>
-          </>}
-
-          {activePanel === "export" && <>
-          <div className="section-heading inspect-heading export-heading">
-            <span className="section-index">04</span>
-            <div>
-              <h2>Export model</h2>
-              <p>Download or hand the printable model to your preferred slicer.</p>
+              <div className="stat-grid">
+                <Stat label="Trace segments" value={layerTraceCount} />
+                <Stat label="B.Cu pads" value={backPads.length} />
+                <Stat label="Holes" value={board?.stats.holes ?? 0} />
+                <Stat label="Vias" value={board?.stats.vias ?? 0} />
+                <Stat label="B.Cu zones" value={backZones.length} />
+                <Stat label="Zone fills" value={backZones.reduce((total, zone) => total + zone.polygons.length, 0)} />
+              </div>
             </div>
-          </div>
-          <div className="export-stack">
-            <button
-              type="button"
-              className="primary-export"
-              onClick={() => void exportModel("3mf")}
-              disabled={!board || busy || exportBlocked}
-            >
-              <span><small>RECOMMENDED</small>Download 3MF</span><b>↓</b>
-            </button>
-            <div className="slicer-preference">
-              <label htmlFor="preferred-slicer">Preferred slicer</label>
-              <select
-                id="preferred-slicer"
-                value={preferredSlicer}
-                onChange={(event) => selectSlicer(normalizeSlicerPreference(event.target.value))}
+
+            <div className="recipe-summary" aria-label="Output recipe">
+              <div className="recipe-heading">OUTPUT RECIPE</div>
+              <div className="recipe-grid">
+                <RecipeStat label="Overall size" value={modelSizeSummary} />
+                <RecipeStat label="Vertical stack" value={verticalStackSummary} />
+                <RecipeStat label="Profile" value={profileSummary} />
+                <RecipeStat label="Route widths" value={widthSummary} />
+              </div>
+            </div>
+
+            <div className="printability-group">
+              <div className="check-header">
+                <span>PRINTABILITY</span>
+                <span className="check-counts">
+                  {blockingErrorCount > 0 && (
+                    <span className="check-count error">{blockingErrorCount} {blockingErrorCount === 1 ? "BLOCKER" : "BLOCKERS"}</span>
+                  )}
+                  {nonBlockingWarningCount > 0 && (
+                    <span className="check-count warning">{nonBlockingWarningCount} {nonBlockingWarningCount === 1 ? "WARNING" : "WARNINGS"}</span>
+                  )}
+                  {printableWarnings.length === 0 && <span className="check-count">PASS</span>}
+                </span>
+              </div>
+
+              <div className="warning-list">
+                {!board ? (
+                  <div className="empty-check">Load a board to run geometry checks.</div>
+                ) : printableWarnings.length === 0 ? (
+                  <div className="pass-check"><span>✓</span><div><strong>Ready to form</strong><small>No known printability blockers.</small></div></div>
+                ) : printableWarnings.map((warning, index) => (
+                  <div className={`warning-item ${warning.severity}`} key={`${warning.code}-${index}`}>
+                    <span>{warning.severity === "error" ? "!" : index + 1}</span>
+                    <p>{warning.message}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          <section className="panel-card export-section" aria-labelledby="export-heading">
+            <div className="section-heading inspect-heading export-heading">
+              <span className="section-index">04</span>
+              <div>
+                <h2 id="export-heading">Export model</h2>
+                <p>Download or hand off the printable model.</p>
+              </div>
+            </div>
+            <div className="export-stack">
+              <div
+                id="model-export-readiness"
+                className={`export-readiness ${exportReadinessState}`}
+                role="status"
               >
-                {SLICER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-              </select>
-              <p>Saved on this device. Your browser may offer this slicer or another compatible destination.</p>
+                <strong>{exportDisabledReason ?? "Model prepared."}</strong>
+                {firstBlocker && !busy && <span>{firstBlocker.message}</span>}
+                {!eligibilityReason && currentPreparation?.phase === "error" && (
+                  <>
+                    <span>{currentPreparation.message}</span>
+                    <button type="button" className="export-retry" onClick={() => setExportRetry((value) => value + 1)}>
+                      Retry preparation
+                    </button>
+                  </>
+                )}
+                {modelReady && preparedModel && (
+                  <span>Prepared locally · 3MF {formatFileSize(preparedModel.threeMf.byteLength)} · STL {formatFileSize(preparedModel.stl.byteLength)}</span>
+                )}
+                {!exportDisabledReason && nonBlockingWarningCount > 0 && (
+                  <span>{nonBlockingWarningCount} non-blocking {nonBlockingWarningCount === 1 ? "warning remains" : "warnings remain"} for review.</span>
+                )}
+              </div>
+              <button
+                type="button"
+                className="primary-export"
+                onClick={() => exportModel("3mf")}
+                disabled={!modelReady}
+                aria-describedby="model-export-readiness"
+              >
+                <span><small>RECOMMENDED</small>Download 3MF</span><b>↓</b>
+              </button>
+              <div className="slicer-preference">
+                <label htmlFor="preferred-slicer">Preferred slicer</label>
+                <select
+                  id="preferred-slicer"
+                  value={preferredSlicer}
+                  onChange={(event) => selectSlicer(normalizeSlicerPreference(event.target.value))}
+                >
+                  {SLICER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+                <p>Saved on this device. The browser may offer any compatible destination.</p>
+              </div>
+              <button
+                type="button"
+                className="slicer-export"
+                onClick={handoffToSlicer}
+                disabled={!modelReady}
+                aria-describedby="model-export-readiness"
+              >
+                {slicerActionLabel(preferredSlicer)} <span>↗</span>
+              </button>
+              <button
+                type="button"
+                className="secondary-export"
+                onClick={() => exportModel("stl")}
+                disabled={!modelReady}
+                aria-describedby="model-export-readiness"
+              >
+                Download STL <span>↓</span>
+              </button>
+              <button type="button" className="project-export" onClick={exportProject} disabled={!board || busy}>
+                Save editable project
+              </button>
             </div>
-            <button
-              type="button"
-              className="slicer-export"
-              onClick={() => void handoffToSlicer()}
-              disabled={!board || busy || exportBlocked}
-            >
-              {slicerActionLabel(preferredSlicer)} <span>↗</span>
-            </button>
-            <button
-              type="button"
-              className="secondary-export"
-              onClick={() => void exportModel("stl")}
-              disabled={!board || busy || exportBlocked}
-            >
-              Download STL <span>↓</span>
-            </button>
-            <button type="button" className="project-export" onClick={exportProject} disabled={!board || busy}>
-              Save editable project
-            </button>
-          </div>
-          </>}
+          </section>
         </aside>
-        )}
       </section>
-
     </main>
   );
 }
@@ -719,11 +879,13 @@ function BoardCanvas({
   settings,
   viewMode,
   conflicts,
+  theme,
 }: {
   board: ParsedBoard | null;
   settings: GeneratorSettings;
   viewMode: ViewMode;
   conflicts: ClearanceConflict[];
+  theme: ThemeMode;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -741,14 +903,14 @@ function BoardCanvas({
       const context = canvas.getContext("2d");
       if (!context) return;
       context.scale(ratio, ratio);
-      drawBoard(context, rect.width, rect.height, board, settings, viewMode, conflicts);
+      drawBoard(context, rect.width, rect.height, board, settings, viewMode, conflicts, theme);
     };
 
     const observer = new ResizeObserver(render);
     observer.observe(container);
     render();
     return () => observer.disconnect();
-  }, [board, conflicts, settings, viewMode]);
+  }, [board, conflicts, settings, theme, viewMode]);
 
   return <canvas ref={canvasRef} className="board-canvas" aria-label="Generated board preview" />;
 }
@@ -761,12 +923,14 @@ function drawBoard(
   settings: GeneratorSettings,
   viewMode: ViewMode,
   conflicts: ClearanceConflict[],
+  theme: ThemeMode,
 ) {
+  const palette = CANVAS_THEMES[theme];
   context.clearRect(0, 0, width, height);
-  drawGrid(context, width, height);
+  drawGrid(context, width, height, palette);
   if (!board) {
-    context.fillStyle = "rgba(221, 210, 197, .68)";
-    context.font = "500 13px var(--font-geist-mono), monospace";
+    context.fillStyle = palette.canvasText;
+    context.font = '500 13px "Fira Code", monospace';
     context.textAlign = "center";
     context.fillText("WAITING FOR BOARD GEOMETRY", width / 2, height / 2);
     return;
@@ -782,53 +946,41 @@ function drawBoard(
         { x: minX, y: minY + boardHeight },
       ];
 
-  const padX = 68;
-  const padY = 72;
-  const availableWidth = Math.max(80, width - padX * 2);
-  const availableHeight = Math.max(80, height - padY * 2);
-  const angled = viewMode === "angled";
-  const scale = angled
-    ? Math.min(availableWidth / (boardWidth + boardHeight * 0.42), availableHeight / (boardHeight * 0.58 + boardWidth * 0.13))
-    : Math.min(availableWidth / boardWidth, availableHeight / boardHeight);
-  const centerX = width / 2;
-  const centerY = height / 2 + (angled ? 18 : 0);
-
-  const project = (point: { x: number; y: number }, z = 0) => {
-    const x = point.x - minX - boardWidth / 2;
-    const y = point.y - minY - boardHeight / 2;
-    const mirroredX = -x;
-    return angled
-      ? { x: centerX + (mirroredX - y * 0.42) * scale, y: centerY + (mirroredX * 0.13 + y * 0.58) * scale - z * scale }
-      : { x: centerX + mirroredX * scale, y: centerY + y * scale - z * scale };
-  };
+  const { angled, project, reliefTraceHeight: reliefZ, scale } = createPreviewProjection({
+    width,
+    height,
+    bounds: board.bounds,
+    viewMode,
+    boardThickness: settings.board_thickness,
+    traceHeight: settings.trace_height,
+  });
 
   if (angled) {
     context.save();
-    context.shadowColor = "rgba(0, 0, 0, .52)";
-    context.shadowBlur = 42;
-    context.shadowOffsetY = 26;
+    context.shadowColor = palette.boardShadow;
+    context.shadowBlur = 24;
+    context.shadowOffsetY = 12;
     drawPolygon(context, outline.map((point) => project(point, -settings.board_thickness)));
-    context.fillStyle = "#312e29";
+    context.fillStyle = palette.boardEdge;
     context.fill();
     context.restore();
+    fillExtrudedLayers(context, [outline], project, -settings.board_thickness, 0, scale, palette.boardEdge);
   }
 
   const topOutline = outline.map((point) => project(point));
   drawPolygon(context, topOutline);
-  const boardFill = context.createLinearGradient(0, topOutline[0]?.y ?? 0, 0, height);
-  boardFill.addColorStop(0, "#ebe2d5");
-  boardFill.addColorStop(1, "#bdb2a3");
-  context.fillStyle = boardFill;
+  context.fillStyle = palette.board;
   context.fill();
-  context.strokeStyle = "#f7eee2";
+  context.strokeStyle = palette.boardEdgeHighlight;
   context.lineWidth = 1.4;
   context.stroke();
 
   context.save();
-  drawPolygon(context, topOutline);
-  context.clip();
+  if (!angled) {
+    drawPolygon(context, topOutline);
+    context.clip();
+  }
 
-  const reliefZ = angled ? settings.trace_height : 0;
   const traceProfiles = buildTraceProfiles(board, settings);
   const visibleZones = (board.zones ?? []).filter((zone) => (
     zone.layer === "B.Cu"
@@ -838,15 +990,54 @@ function drawBoard(
   context.lineCap = "round";
   context.lineJoin = "round";
 
+  if (angled) {
+    const raisedPads = board.pads.filter(isRaisedBackPad);
+    const backVias = board.vias.filter((candidate) => includesBackCopper(candidate.layers));
+    const copperPolygons = [
+      ...visibleZones.flatMap((zone) => zone.polygons),
+      ...traceProfiles.flatMap((profile) => traceProfilePolygons(profile)),
+      ...raisedPads.map(previewPadPolygon),
+      ...backVias.map((via) => ellipsePreviewPolygon(via.position, { x: via.size, y: via.size }, 0)),
+    ].filter((polygon) => polygon.length >= 3);
+
+    context.save();
+    context.shadowColor = palette.traceShadow;
+    context.shadowBlur = 8;
+    context.shadowOffsetY = 5;
+    fillProjectedPolygons(context, copperPolygons, project, 0, palette.traceRelief);
+    context.restore();
+    fillExtrudedLayers(context, copperPolygons, project, 0, reliefZ, scale, palette.traceRelief);
+    fillProjectedPolygons(context, copperPolygons, project, reliefZ, palette.trace);
+    strokeProfileCenters(context, traceProfiles, project, reliefZ, 0,
+      Math.max(0.5, 0.055 * scale), palette.traceHighlight);
+
+    for (const pad of board.pads) {
+      if (pad.drill === null || pad.drill <= 0) continue;
+      const holeDiameter = pad.drill + settings.hole_compensation;
+      const hole = ellipsePreviewPolygon(pad.position, { x: holeDiameter, y: holeDiameter }, 0);
+      fillProjectedPolygons(context, [hole], project, isRaisedBackPad(pad) ? reliefZ : 0, palette.hole);
+    }
+    for (const via of backVias) {
+      const holeDiameter = via.drill + settings.hole_compensation;
+      const hole = ellipsePreviewPolygon(via.position, { x: holeDiameter, y: holeDiameter }, 0);
+      fillProjectedPolygons(context, [hole], project, reliefZ, palette.hole);
+    }
+
+    drawConflictMarkers(context, conflicts, project, reliefZ + settings.trace_height * 0.25, palette);
+    context.restore();
+    drawReliefLegend(context, height, settings, palette);
+    return;
+  }
+
   for (const zone of visibleZones) {
     for (const polygon of zone.polygons) {
       if (polygon.length < 3) continue;
       const projected = polygon.map((point) => project(point, reliefZ));
       drawPolygon(context, projected);
-      context.shadowColor = angled ? "rgba(65, 28, 10, .44)" : "transparent";
+      context.shadowColor = angled ? palette.traceShadow : "transparent";
       context.shadowBlur = angled ? 7 : 0;
       context.shadowOffsetY = angled ? 4 : 0;
-      context.fillStyle = "#c76231";
+      context.fillStyle = palette.trace;
       context.fill();
     }
   }
@@ -854,12 +1045,12 @@ function drawBoard(
   // Draw every relief polygon before any copper surface so adjacent tapers
   // remain visually continuous without dark segment seams.
   fillTraceProfiles(context, traceProfiles, project, reliefZ, 0,
-    settings.trace_height * .8 + 2 / scale, "rgba(65, 28, 10, .44)");
+    settings.trace_height * .8 + 2 / scale, palette.traceRelief);
 
   const copperLift = angled ? settings.trace_height * scale * .2 : 0;
-  fillTraceProfiles(context, traceProfiles, project, reliefZ, copperLift, 0, "#c76231");
+  fillTraceProfiles(context, traceProfiles, project, reliefZ, copperLift, 0, palette.trace);
   strokeProfileCenters(context, traceProfiles, project, reliefZ, copperLift,
-    Math.max(0.6, 0.075 * scale), "rgba(255, 220, 178, .82)");
+    Math.max(0.5, 0.06 * scale), palette.traceHighlight);
 
   for (const pad of board.pads) {
     const raised = isRaisedBackPad(pad);
@@ -871,10 +1062,10 @@ function drawBoard(
     // The printable B.Cu view reflects X, which reverses non-circular pad angles.
     context.rotate((-pad.rotation * Math.PI) / 180);
     if (raised) {
-      context.shadowColor = "rgba(58, 22, 7, .48)";
+      context.shadowColor = palette.traceShadow;
       context.shadowBlur = angled ? 7 : 2;
       context.shadowOffsetY = angled ? 4 : 1;
-      context.fillStyle = "#c76231";
+      context.fillStyle = palette.trace;
       if (pad.shape === "circle" || pad.shape === "oval") {
         context.beginPath();
         context.ellipse(0, 0, (pad.size.x * scale) / 2, (pad.size.y * scale) / 2, 0, 0, Math.PI * 2);
@@ -887,7 +1078,7 @@ function drawBoard(
       context.beginPath();
       context.arc(0, 0, (((pad.drill ?? 0) + settings.hole_compensation) * scale) / 2, 0, Math.PI * 2);
       context.shadowColor = "transparent";
-      context.fillStyle = "#191816";
+      context.fillStyle = palette.hole;
       context.fill();
     }
     context.restore();
@@ -897,47 +1088,27 @@ function drawBoard(
     const point = project(via.position, reliefZ);
     context.beginPath();
     context.arc(point.x, point.y, (via.size * scale) / 2, 0, Math.PI * 2);
-    context.fillStyle = "#c76231";
+    context.fillStyle = palette.trace;
     context.fill();
     context.beginPath();
     context.arc(point.x, point.y, ((via.drill + settings.hole_compensation) * scale) / 2, 0, Math.PI * 2);
-    context.fillStyle = "#191816";
+    context.fillStyle = palette.hole;
     context.fill();
   }
 
-  for (const conflict of conflicts) {
-    const point = project(conflict.location, reliefZ + (angled ? settings.trace_height * .2 : 0));
-    context.beginPath();
-    context.arc(point.x, point.y, 8, 0, Math.PI * 2);
-    context.fillStyle = "rgba(198, 42, 49, .3)";
-    context.fill();
-    context.beginPath();
-    context.arc(point.x, point.y, 4, 0, Math.PI * 2);
-    context.fillStyle = "#ff4f55";
-    context.fill();
-    context.strokeStyle = "#fff4f2";
-    context.lineWidth = 1.25;
-    context.stroke();
-  }
+  drawConflictMarkers(context, conflicts, project, reliefZ, palette);
   context.restore();
-
-  if (angled) {
-    context.strokeStyle = "rgba(255, 209, 166, .32)";
-    context.lineWidth = 1;
-    drawPolygon(context, outline.map((point) => project(point, reliefZ)));
-    context.stroke();
-  }
-  if (!angled) drawScaleRuler(context, scale, height);
+  drawScaleRuler(context, scale, height, palette);
 }
 
-function drawScaleRuler(context: CanvasRenderingContext2D, pixelsPerMillimeter: number, height: number) {
+function drawScaleRuler(context: CanvasRenderingContext2D, pixelsPerMillimeter: number, height: number, palette: CanvasPalette) {
   const millimeters = [20, 10, 5, 2, 1].find((candidate) => candidate * pixelsPerMillimeter <= 120) ?? 1;
   const length = millimeters * pixelsPerMillimeter;
   const x = 20;
   const y = height - 50;
   context.save();
-  context.strokeStyle = "rgba(211, 201, 189, .82)";
-  context.fillStyle = "rgba(211, 201, 189, .9)";
+  context.strokeStyle = palette.ruler;
+  context.fillStyle = palette.ruler;
   context.lineWidth = 1;
   context.beginPath();
   context.moveTo(x, y - 6);
@@ -945,11 +1116,137 @@ function drawScaleRuler(context: CanvasRenderingContext2D, pixelsPerMillimeter: 
   context.lineTo(x + length, y);
   context.lineTo(x + length, y - 6);
   context.stroke();
-  context.font = "600 10px var(--font-geist-mono), monospace";
+  context.font = '600 10px "Fira Code", monospace';
   context.textAlign = "left";
   context.fillText("0", x, y - 10);
   context.textAlign = "right";
   context.fillText(`${millimeters} mm`, x + length, y - 10);
+  context.restore();
+}
+
+function fillProjectedPolygons(
+  context: CanvasRenderingContext2D,
+  polygons: Array<Array<{ x: number; y: number }>>,
+  project: (point: { x: number; y: number }, z?: number) => { x: number; y: number },
+  z: number,
+  fillStyle: string,
+) {
+  context.fillStyle = fillStyle;
+  for (const polygon of polygons) {
+    if (polygon.length < 3) continue;
+    drawPolygon(context, polygon.map((point) => project(point, z)));
+    context.fill();
+  }
+}
+
+function fillExtrudedLayers(
+  context: CanvasRenderingContext2D,
+  polygons: Array<Array<{ x: number; y: number }>>,
+  project: (point: { x: number; y: number }, z?: number) => { x: number; y: number },
+  bottomZ: number,
+  topZ: number,
+  scale: number,
+  fillStyle: string,
+) {
+  const pixelHeight = Math.abs(topZ - bottomZ) * scale;
+  const layers = Math.max(2, Math.min(18, Math.ceil(pixelHeight / 1.25)));
+  for (let layer = 0; layer < layers; layer += 1) {
+    const z = bottomZ + (topZ - bottomZ) * (layer / layers);
+    fillProjectedPolygons(context, polygons, project, z, fillStyle);
+  }
+}
+
+function previewPadPolygon(pad: ParsedBoard["pads"][number]) {
+  if (pad.shape === "circle" || pad.shape === "oval") {
+    return ellipsePreviewPolygon(pad.position, pad.size, pad.rotation);
+  }
+  const halfWidth = pad.size.x / 2;
+  const halfHeight = pad.size.y / 2;
+  return [
+    { x: -halfWidth, y: -halfHeight },
+    { x: halfWidth, y: -halfHeight },
+    { x: halfWidth, y: halfHeight },
+    { x: -halfWidth, y: halfHeight },
+  ].map((point) => rotatePreviewPoint(point, pad.position, pad.rotation));
+}
+
+function ellipsePreviewPolygon(
+  center: { x: number; y: number },
+  size: { x: number; y: number },
+  rotation: number,
+  segments = 32,
+) {
+  return Array.from({ length: segments }, (_, index) => {
+    const angle = (index / segments) * Math.PI * 2;
+    return rotatePreviewPoint(
+      { x: Math.cos(angle) * size.x / 2, y: Math.sin(angle) * size.y / 2 },
+      center,
+      rotation,
+    );
+  });
+}
+
+function rotatePreviewPoint(
+  point: { x: number; y: number },
+  center: { x: number; y: number },
+  rotation: number,
+) {
+  const radians = rotation * Math.PI / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  return {
+    x: center.x + point.x * cosine - point.y * sine,
+    y: center.y + point.x * sine + point.y * cosine,
+  };
+}
+
+function drawConflictMarkers(
+  context: CanvasRenderingContext2D,
+  conflicts: ClearanceConflict[],
+  project: (point: { x: number; y: number }, z?: number) => { x: number; y: number },
+  z: number,
+  palette: CanvasPalette,
+) {
+  for (const conflict of conflicts) {
+    const point = project(conflict.location, z);
+    context.beginPath();
+    context.arc(point.x, point.y, 8, 0, Math.PI * 2);
+    context.fillStyle = palette.conflictHalo;
+    context.fill();
+    context.beginPath();
+    context.arc(point.x, point.y, 4, 0, Math.PI * 2);
+    context.fillStyle = palette.conflict;
+    context.fill();
+    context.strokeStyle = palette.boardEdgeHighlight;
+    context.lineWidth = 1.25;
+    context.stroke();
+  }
+}
+
+function drawReliefLegend(
+  context: CanvasRenderingContext2D,
+  height: number,
+  settings: GeneratorSettings,
+  palette: CanvasPalette,
+) {
+  const label = `Z ×${RELIEF_Z_EXAGGERATION} · BOARD ${settings.board_thickness.toFixed(1)} · TRACE ${settings.trace_height.toFixed(2)} mm`;
+  context.save();
+  context.font = '650 10px "Fira Code", monospace';
+  const boxWidth = context.measureText(label).width + 18;
+  const boxHeight = 26;
+  const x = 18;
+  const y = height - boxHeight - 18;
+  context.beginPath();
+  context.roundRect(x, y, boxWidth, boxHeight, 6);
+  context.fillStyle = palette.reliefBadge;
+  context.fill();
+  context.strokeStyle = palette.reliefOutline;
+  context.lineWidth = 1;
+  context.stroke();
+  context.fillStyle = palette.reliefBadgeText;
+  context.textAlign = "left";
+  context.textBaseline = "middle";
+  context.fillText(label, x + 9, y + boxHeight / 2 + 0.5);
   context.restore();
 }
 
@@ -1002,13 +1299,46 @@ function strokeProfileCenters(
   }
 }
 
-function drawGrid(context: CanvasRenderingContext2D, width: number, height: number) {
-  const background = context.createLinearGradient(0, 0, 0, height);
-  background.addColorStop(0, "#2c2925");
-  background.addColorStop(1, "#181715");
-  context.fillStyle = background;
+type CanvasPalette = {
+  background: string;
+  grid: string;
+  canvasText: string;
+  board: string;
+  boardEdge: string;
+  boardEdgeHighlight: string;
+  boardShadow: string;
+  trace: string;
+  traceShadow: string;
+  traceRelief: string;
+  traceHighlight: string;
+  hole: string;
+  conflict: string;
+  conflictHalo: string;
+  reliefOutline: string;
+  reliefBadge: string;
+  reliefBadgeText: string;
+  ruler: string;
+};
+
+const CANVAS_THEMES: Record<ThemeMode, CanvasPalette> = {
+  light: {
+    background: "#6f8994", grid: "rgba(244, 239, 231, .18)", canvasText: "rgba(247, 242, 234, .78)",
+    board: "#f1eadf", boardEdge: "#456879", boardEdgeHighlight: "#fffaf4", boardShadow: "rgba(38, 57, 67, .28)",
+    trace: "#b96862", traceShadow: "rgba(63, 79, 86, .28)", traceRelief: "#7d6261", traceHighlight: "rgba(255, 239, 223, .72)",
+    hole: "#355766", conflict: "#a84f4d", conflictHalo: "rgba(168, 79, 77, .3)", reliefOutline: "rgba(255, 244, 235, .45)", reliefBadge: "rgba(43, 62, 71, .78)", reliefBadgeText: "#fffaf4", ruler: "rgba(247, 242, 234, .86)",
+  },
+  dim: {
+    background: "#304752", grid: "rgba(207, 220, 222, .12)", canvasText: "rgba(224, 232, 231, .72)",
+    board: "#d8d4cc", boardEdge: "#405e6c", boardEdgeHighlight: "#f2eee7", boardShadow: "rgba(15, 27, 34, .4)",
+    trace: "#c77a74", traceShadow: "rgba(20, 31, 37, .4)", traceRelief: "#75575a", traceHighlight: "rgba(255, 226, 210, .62)",
+    hole: "#263a45", conflict: "#dd817c", conflictHalo: "rgba(221, 129, 124, .28)", reliefOutline: "rgba(241, 236, 226, .34)", reliefBadge: "rgba(14, 25, 31, .78)", reliefBadgeText: "#f2eee7", ruler: "rgba(221, 230, 229, .78)",
+  },
+};
+
+function drawGrid(context: CanvasRenderingContext2D, width: number, height: number, palette: CanvasPalette) {
+  context.fillStyle = palette.background;
   context.fillRect(0, 0, width, height);
-  context.strokeStyle = "rgba(214, 199, 181, .13)";
+  context.strokeStyle = palette.grid;
   context.lineWidth = 1;
   for (let x = 18; x < width; x += 24) {
     for (let y = 18; y < height; y += 24) {
@@ -1060,7 +1390,7 @@ function TraceStyleControl({
   const descriptions: Record<GeneratorSettings["trace_style"], string> = {
     technical: "Keeps straight routed segments and the original linear width transition.",
     soft: "Keeps routed paths straight but eases pad tapers for softer shoulders.",
-    vintage: "Adds eased pad teardrops and tangent bends at safe, unbranched corners.",
+    vintage: "Adds eased pad teardrops and constant-radius fillets at safe, unbranched corners.",
   };
   return (
     <div className="width-mode-field trace-style-field">
@@ -1130,14 +1460,8 @@ function Stat({ label, value }: { label: string; value: number }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function downloadBlob(bytes: Uint8Array, name: string, type: string) {
-  const blob = new Blob([bytes as BlobPart], { type });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(url);
+function RecipeStat({ label, value }: { label: string; value: string }) {
+  return <div><span>{label}</span><strong>{value}</strong></div>;
 }
 
 function cleanName(value: string) {
@@ -1145,6 +1469,17 @@ function cleanName(value: string) {
     .replace(/\.(kicad_pcb|copperline\.json|json)$/i, "")
     .replace(/[^a-z0-9-_]+/gi, "-")
     .replace(/^-+|-+$/g, "") || "copperline-board";
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function traceStyleLabel(value: GeneratorSettings["trace_style"]) {
+  if (value === "technical") return "Technical";
+  if (value === "soft") return "Soft";
+  return "Vintage";
 }
 
 function includesBackCopper(layers: string[]) {

@@ -88,6 +88,31 @@ export type GeneratorSettings = {
   hole_compensation: number;
 };
 
+type NettedFeature = { net_id?: number | null; net_name?: string | null };
+
+function normalizeFeatureNet<T extends NettedFeature>(feature: T): T {
+  const netId = feature.net_id;
+  const normalizedId = typeof netId === "number" && Number.isInteger(netId) && netId > 0
+    ? netId
+    : null;
+  return {
+    ...feature,
+    net_id: normalizedId,
+    net_name: feature.net_name ?? null,
+  };
+}
+
+/** Canonicalize legacy project data to the same contract emitted by Rust. */
+export function normalizeParsedBoard(board: ParsedBoard): ParsedBoard {
+  return {
+    ...board,
+    traces: board.traces.map(normalizeFeatureNet),
+    pads: board.pads.map(normalizeFeatureNet),
+    vias: board.vias.map(normalizeFeatureNet),
+    zones: board.zones?.map(normalizeFeatureNet),
+  };
+}
+
 type PcbCoreExports = {
   memory: WebAssembly.Memory;
   alloc: (length: number) => number;
@@ -106,7 +131,7 @@ let corePromise: Promise<PcbCoreExports> | null = null;
 
 async function loadCore(): Promise<PcbCoreExports> {
   if (!corePromise) {
-    corePromise = (async () => {
+    const attempt = (async () => {
       const response = await fetch("/pcb_core.wasm");
       if (!response.ok) {
         throw new Error("The geometry engine could not be loaded.");
@@ -119,6 +144,12 @@ async function loadCore(): Promise<PcbCoreExports> {
       const instance = await WebAssembly.instantiate(wasmModule, {});
       return instance.exports as unknown as PcbCoreExports;
     })();
+    corePromise = attempt.catch((error) => {
+      // A transient fetch/compile failure must not poison the session. The
+      // next parse or export preparation will make a fresh load attempt.
+      corePromise = null;
+      throw error;
+    });
   }
 
   return corePromise;
@@ -188,7 +219,7 @@ export async function parseKicad(source: string): Promise<ParsedBoard> {
     throw new Error(result.error);
   }
 
-  return result;
+  return normalizeParsedBoard(result);
 }
 
 export async function generateStl(
@@ -196,8 +227,9 @@ export async function generateStl(
   settings: GeneratorSettings,
 ): Promise<Uint8Array> {
   const encoder = new TextEncoder();
+  const normalizedBoard = normalizeParsedBoard(board);
   return callCore("generate_stl", [
-    encoder.encode(JSON.stringify(board)),
+    encoder.encode(JSON.stringify(normalizedBoard)),
     encoder.encode(JSON.stringify(settings)),
   ]);
 }

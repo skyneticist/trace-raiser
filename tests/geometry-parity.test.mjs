@@ -124,11 +124,14 @@ test("TypeScript preview and shipped Rust/WASM agree on styled copper extents an
     bounds: { min_x: 0, min_y: 0, max_x: 50, max_y: 50, width: 50, height: 50 },
     outline: [{ x: 0, y: 0 }, { x: 50, y: 0 }, { x: 50, y: 50 }, { x: 0, y: 50 }],
     traces: [
+      trace({ x: 10, y: 12 }, { x: 22, y: 12 }, 0.6),
       trace({ x: 10, y: 25 }, { x: 25, y: 25 }, 0.6),
       trace({ x: 25, y: 25 }, { x: 35, y: 35 }, 3),
       trace({ x: 35, y: 35 }, { x: 42, y: 35 }, 0.6),
     ],
     pads: [
+      pad({ x: 10, y: 12 }, { x: 4, y: 4 }, "circle", 0),
+      pad({ x: 22, y: 12 }, { x: 4, y: 4 }, "circle", 0),
       pad({ x: 10, y: 25 }, { x: 4, y: 4 }, "circle", 0),
       pad({ x: 42, y: 35 }, { x: 5, y: 3 }, "oval", 30),
     ],
@@ -137,7 +140,7 @@ test("TypeScript preview and shipped Rust/WASM agree on styled copper extents an
       polygons: [[{ x: 2, y: 2 }, { x: 8, y: 2 }, { x: 8, y: 8 }, { x: 2, y: 8 }]],
     }],
     vias: [], warnings: [],
-    stats: { traces: 3, pads: 2, vias: 0, holes: 2 },
+    stats: { traces: 4, pads: 4, vias: 0, holes: 4 },
   };
 
   for (const trace_style of ["technical", "soft", "vintage"]) {
