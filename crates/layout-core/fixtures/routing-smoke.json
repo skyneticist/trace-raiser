@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "name": "routing-obstacle-smoke",
+  "outline": {
+    "vertices": [
+      { "x": 0.0, "y": 0.0 },
+      { "x": 30.0, "y": 0.0 },
+      { "x": 30.0, "y": 20.0 },
+      { "x": 0.0, "y": 20.0 }
+    ]
+  },
+  "placement_keepouts": [],
+  "components": [
+    {
+      "id": "J1",
+      "reference": "J1",
+      "footprint": "Connector:PinHeader_1x01",
+      "envelope": {
+        "min_x": -1.5,
+        "min_y": -1.5,
+        "max_x": 1.5,
+        "max_y": 1.5
+      },
+      "pads": [
+        {
+          "id": "1",
+          "local_position": { "x": 0.0, "y": 0.0 },
+          "size": { "x": 3.0, "y": 3.0 },
+          "drill_mm": 1.0,
+          "kind": "through_hole"
+        }
+      ],
+      "initial_pose": {
+        "x": 5.0,
+        "y": 10.0,
+        "rotation_degrees": 0.0
+      },
+      "locked": true,
+      "allowed_rotations_degrees": [0.0]
+    },
+    {
+      "id": "H1",
+      "reference": "H1",
+      "footprint": "MountingHole:MountingHole_2mm",
+      "envelope": {
+        "min_x": -2.5,
+        "min_y": -2.5,
+        "max_x": 2.5,
+        "max_y": 2.5
+      },
+      "pads": [
+        {
+          "id": "1",
+          "local_position": { "x": 0.0, "y": 0.0 },
+          "size": { "x": 4.0, "y": 4.0 },
+          "drill_mm": 2.0,
+          "kind": "non_plated_through_hole"
+        }
+      ],
+      "initial_pose": {
+        "x": 15.0,
+        "y": 10.0,
+        "rotation_degrees": 0.0
+      },
+      "locked": true,
+      "allowed_rotations_degrees": [0.0]
+    },
+    {
+      "id": "J2",
+      "reference": "J2",
+      "footprint": "Connector:PinHeader_1x01",
+      "envelope": {
+        "min_x": -1.5,
+        "min_y": -1.5,
+        "max_x": 1.5,
+        "max_y": 1.5
+      },
+      "pads": [
+        {
+          "id": "1",
+          "local_position": { "x": 0.0, "y": 0.0 },
+          "size": { "x": 3.0, "y": 3.0 },
+          "drill_mm": 1.0,
+          "kind": "through_hole"
+        }
+      ],
+      "initial_pose": {
+        "x": 25.0,
+        "y": 10.0,
+        "rotation_degrees": 0.0
+      },
+      "locked": true,
+      "allowed_rotations_degrees": [0.0]
+    }
+  ],
+  "nets": [
+    {
+      "id": "N1",
+      "name": "SIGNAL",
+      "terminals": [
+        { "component_id": "J1", "pad_id": "1" },
+        { "component_id": "J2", "pad_id": "1" }
+      ]
+    }
+  ],
+  "placement_rules": {
+    "grid_mm": 1.0,
+    "component_clearance_mm": 1.0,
+    "edge_clearance_mm": 1.0
+  },
+  "routing_rules": {
+    "grid_mm": 0.5,
+    "trace_width_mm": 1.4,
+    "trace_clearance_mm": 0.8,
+    "edge_clearance_mm": 1.0
+  },
+  "jumper_policy": {
+    "mode": "forbidden",
+    "approvals": []
+  }
+}

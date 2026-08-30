@@ -22,12 +22,20 @@ function callCore(core, method, inputs) {
   });
 
   try {
-    const handle = method === "parse_kicad"
-      ? core.parse_kicad(pointers[0], inputs[0].byteLength)
-      : core.generate_stl(
-          pointers[0], inputs[0].byteLength,
-          pointers[1], inputs[1].byteLength,
-        );
+    let handle;
+    if (method === "parse_kicad") {
+      handle = core.parse_kicad(pointers[0], inputs[0].byteLength);
+    } else if (method === "auto_layout") {
+      handle = core.auto_layout(
+        pointers[0], inputs[0].byteLength,
+        pointers[1], inputs[1].byteLength,
+      );
+    } else {
+      handle = core.generate_stl(
+        pointers[0], inputs[0].byteLength,
+        pointers[1], inputs[1].byteLength,
+      );
+    }
     const { pointer, length } = unpack(handle);
     assert.ok(pointer && length, `${method} returned an empty result`);
     const output = new Uint8Array(core.memory.buffer, pointer, length).slice();
@@ -86,9 +94,11 @@ function pointInTriangle([px, py], [a, b, c]) {
 }
 
 test("shipped WASM emits a watertight sample board with every drill open", async () => {
-  const [wasmBytes, source] = await Promise.all([
+  const [wasmBytes, autoLayoutBytes, source, unroutedSource] = await Promise.all([
     readFile(new URL("../public/pcb_core.wasm", import.meta.url)),
+    readFile(new URL("../public/autolayout_core.wasm", import.meta.url)),
     readFile(new URL("../public/sample-sensor.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-unrouted.kicad_pcb", import.meta.url), "utf8"),
   ]);
   const wasmModule = await WebAssembly.compile(wasmBytes);
   const instance = await WebAssembly.instantiate(wasmModule, {});
@@ -180,4 +190,41 @@ test("shipped WASM emits a watertight sample board with every drill open", async
       && pointInTriangle(center, triangle)
     )), `drill axis ${center.join(",")} is open`);
   }
+
+  const autoLayoutModule = await WebAssembly.compile(autoLayoutBytes);
+  const autoLayoutInstance = await WebAssembly.instantiate(autoLayoutModule, {});
+  const autoLayoutCore = autoLayoutInstance.exports;
+  const proposal = JSON.parse(decoder.decode(callCore(autoLayoutCore, "auto_layout", [
+    encoder.encode(unroutedSource),
+    encoder.encode(JSON.stringify({
+      seed: 424242,
+      placement_restarts: 2,
+      placement_refinement_passes: 0,
+      placement_max_grid_points: 10000,
+      placement_grid_mm: 1,
+      component_clearance_mm: 1,
+      edge_clearance_mm: 1,
+      routing_grid_mm: 0.5,
+      trace_width_mm: 1,
+      trace_clearance_mm: 0.8,
+      routing_max_search_nodes: 250000,
+      routing_reroute_passes: 6,
+      bend_penalty_mm: 0.25,
+      congestion_penalty_mm: 2,
+    })),
+  ])));
+  assert.equal(proposal.schema_version, 1);
+  assert.equal(proposal.requires_kicad_drc, true);
+  assert.equal(proposal.metrics.routed_net_count, 1);
+  assert.equal(proposal.metrics.total_net_count, 1);
+  assert.ok(proposal.metrics.segment_count > 0);
+  assert.match(proposal.proposal_id, /^sha256:[a-f0-9]{64}$/);
+  assert.doesNotMatch(unroutedSource, /\(segment\b/);
+  assert.match(proposal.candidate_source, /\(segment\b/);
+
+  const candidate = JSON.parse(decoder.decode(callCore(core, "parse_kicad", [
+    encoder.encode(proposal.candidate_source),
+  ])));
+  assert.equal(candidate.stats.traces, proposal.metrics.segment_count);
+  assert.equal(candidate.stats.holes, 2);
 });
