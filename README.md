@@ -73,5 +73,5 @@ footprint, outline, or routing geometry. Copperline's separate
 [AutoLayout foundation](docs/autolayout/FOUNDATION.md) now accepts a KiCad PCB
 with footprints and an outline, and provides deterministic placement and
 single-layer routing with explicitly reviewed jumper proposals. Footprint
-assignment, syntax-preserving KiCad track emission, and integration into the
-Studio upload flow are still later product stages.
+assignment and integration of the syntax-preserving candidate generator into
+the Studio preview/compare/accept flow are still later product stages.

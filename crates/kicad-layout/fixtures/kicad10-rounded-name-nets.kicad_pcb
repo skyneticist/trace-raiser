@@ -69,11 +69,4 @@
     (fill no)
     (layer "Edge.Cuts")
     (uuid "00000000-0000-4000-8000-000000000021"))
-  (segment
-    (start 5 10)
-    (end 25 10)
-    (width 1)
-    (layer "B.Cu")
-    (net "SIGNAL")
-    (uuid "00000000-0000-4000-8000-000000000022"))
 )

@@ -54,8 +54,14 @@ validate_kicad_fixture() {
 
 validate_kicad_fixture public/sample-sensor.kicad_pcb sample-sensor
 validate_kicad_fixture crates/kicad-layout/fixtures/curved-outline.kicad_pcb curved-outline
-validate_kicad_fixture \
+
+cargo run --quiet --manifest-path crates/kicad-layout/Cargo.toml \
+  --example emit_routed_candidate -- \
   crates/kicad-layout/fixtures/kicad10-rounded-name-nets.kicad_pcb \
-  kicad10-rounded-name-nets
+  "$replay_dir/emitted-route.kicad_pcb"
+shasum -a 256 "$replay_dir/emitted-route.kicad_pcb"
+validate_kicad_fixture \
+  "$replay_dir/emitted-route.kicad_pcb" \
+  generated-kicad10-route
 
 echo "AutoLayout checks passed"

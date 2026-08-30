@@ -1,9 +1,12 @@
-//! Syntax-preserving KiCad PCB placement adapter.
+//! Syntax-preserving KiCad PCB placement and routing adapter.
 //!
 //! The adapter intentionally edits only a footprint's immediate `(at ...)`
-//! expression. KiCad remains the parser and DRC authority for emitted boards.
+//! expression and inserts generated track expressions before the board's root
+//! closing parenthesis. KiCad remains the parser and DRC authority for emitted
+//! boards.
 
 mod design;
+mod emission;
 mod geometry;
 pub use design::{DesignBuildError, DesignBuildOptions};
 
@@ -434,6 +437,10 @@ pub struct BoardDocument {
     pub nets: Vec<NetRecord>,
     pub footprints: Vec<FootprintRecord>,
     pub edge_cuts: Vec<EdgePrimitive>,
+    root_insertion_offset: usize,
+    top_level_indent: String,
+    existing_copper_items: usize,
+    existing_uuids: HashSet<String>,
 }
 
 impl BoardDocument {
@@ -449,6 +456,22 @@ impl BoardDocument {
                 message: "expected a kicad_pcb root expression".into(),
             });
         }
+
+        let root_close_offset = root
+            .span
+            .end
+            .checked_sub(1)
+            .expect("a parsed list includes its closing parenthesis");
+        let root_insertion_offset = root_line_insertion_offset(source, root_close_offset);
+        let top_level_indent = detect_top_level_indent(source, &root);
+        let existing_copper_items = root
+            .list()
+            .into_iter()
+            .flatten()
+            .filter(|node| matches!(node.head(), Some("segment" | "arc" | "via" | "zone")))
+            .count();
+        let mut existing_uuids = HashSet::new();
+        collect_uuids(&root, &mut existing_uuids);
 
         let nets = root
             .children("net")
@@ -486,6 +509,10 @@ impl BoardDocument {
             nets,
             footprints,
             edge_cuts,
+            root_insertion_offset,
+            top_level_indent,
+            existing_copper_items,
+            existing_uuids,
         })
     }
 
@@ -498,12 +525,29 @@ impl BoardDocument {
         self.source.clone()
     }
 
+    /// Number of top-level routed copper objects already present in the board.
+    ///
+    /// Candidate emission refuses to mix generated routes with these objects;
+    /// replacing or preserving existing routing requires a later explicit mode.
+    pub fn existing_copper_item_count(&self) -> usize {
+        self.existing_copper_items
+    }
+
     /// Apply localized footprint pose changes keyed by UUID or reference.
     pub fn rewrite_placements(
         &self,
         placements: &BTreeMap<String, Pose>,
         options: PatchOptions,
     ) -> Result<String, KicadError> {
+        let patches = self.placement_patches(placements, options)?;
+        Ok(self.apply_patches(patches))
+    }
+
+    fn placement_patches(
+        &self,
+        placements: &BTreeMap<String, Pose>,
+        options: PatchOptions,
+    ) -> Result<Vec<(Span, String)>, KicadError> {
         let mut patches = Vec::<(Span, String)>::new();
         let known: HashSet<&str> = self
             .footprints
@@ -554,12 +598,60 @@ impl BoardDocument {
             ));
         }
 
+        Ok(patches)
+    }
+
+    fn apply_patches(&self, mut patches: Vec<(Span, String)>) -> String {
         patches.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
         let mut output = self.source.clone();
         for (span, replacement) in patches {
             output.replace_range(span.start..span.end, &replacement);
         }
-        Ok(output)
+        output
+    }
+}
+
+fn root_line_insertion_offset(source: &str, root_close_offset: usize) -> usize {
+    let line_start = source[..root_close_offset]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    if source[line_start..root_close_offset]
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+    {
+        line_start
+    } else {
+        root_close_offset
+    }
+}
+
+fn detect_top_level_indent(source: &str, root: &Node) -> String {
+    root.list()
+        .into_iter()
+        .flatten()
+        .skip(1)
+        .find_map(|node| {
+            let line_start = source[..node.span.start]
+                .rfind('\n')
+                .map_or(0, |offset| offset + 1);
+            let prefix = &source[line_start..node.span.start];
+            (!prefix.is_empty()
+                && prefix
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r')))
+            .then(|| prefix.trim_end_matches('\r').to_string())
+        })
+        .unwrap_or_else(|| "  ".into())
+}
+
+fn collect_uuids(node: &Node, uuids: &mut HashSet<String>) {
+    if node.head() == Some("uuid") {
+        if let Some(uuid) = node.atom_at(1) {
+            uuids.insert(uuid.to_ascii_lowercase());
+        }
+    }
+    for child in node.list().into_iter().flatten() {
+        collect_uuids(child, uuids);
     }
 }
 

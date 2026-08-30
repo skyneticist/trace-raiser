@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 layout-core = { path = "../layout-core" }
+sha2 = "0.10"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
