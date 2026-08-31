@@ -53,7 +53,7 @@ test("renders source, shaping, diagnostics, and export together on one page", as
     "B.Cu · mirrored · local",
     "Form",
     "Routing",
-    "Try unrouted AutoLayout demo",
+    "Load 10-part AutoLayout assessment",
     "Create routing proposal",
     "Routing constraints",
     "Trace height",
@@ -109,7 +109,7 @@ test("renders source, shaping, diagnostics, and export together on one page", as
 });
 
 test("ships the local geometry engine, typeface, and production metadata", async () => {
-  const [wasm, autoLayoutWasm, social, font, fontLicense, packageJson, page, layout, sample, unroutedSample] = await Promise.all([
+  const [wasm, autoLayoutWasm, social, font, fontLicense, packageJson, page, layout, sample, unroutedSample, assessmentSample] = await Promise.all([
     stat(new URL("../public/pcb_core.wasm", import.meta.url)),
     stat(new URL("../public/autolayout_core.wasm", import.meta.url)),
     stat(new URL("../public/og-v2.png", import.meta.url)),
@@ -120,6 +120,7 @@ test("ships the local geometry engine, typeface, and production metadata", async
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../public/sample-sensor.kicad_pcb", import.meta.url), "utf8"),
     readFile(new URL("../public/sample-unrouted.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-autolayout-assessment.kicad_pcb", import.meta.url), "utf8"),
   ]);
 
   assert.ok(wasm.size > 100_000, "expected a compiled Rust/WASM engine");
@@ -140,6 +141,11 @@ test("ships the local geometry engine, typeface, and production metadata", async
   assert.doesNotMatch(sample, /\spad\s+"[^"]+"\s+smd\s/);
   assert.match(unroutedSample, /^\(kicad_pcb/);
   assert.doesNotMatch(unroutedSample, /\(segment\b/);
+  assert.match(assessmentSample, /^\(kicad_pcb/);
+  assert.equal(assessmentSample.match(/\(footprint /g)?.length, 10);
+  assert.equal(assessmentSample.match(/^  \(net (?:[1-9]|1[0-2])\b/gm)?.length, 12);
+  assert.equal(assessmentSample.match(/np_thru_hole/g)?.length, 2);
+  assert.doesNotMatch(assessmentSample, /\(segment\b/);
 });
 
 test("compiled WebAssembly exposes the browser loader ABI", async () => {

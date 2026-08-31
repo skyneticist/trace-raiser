@@ -52,6 +52,14 @@ export const BALANCED_AUTO_LAYOUT_OPTIONS: AutoLayoutOptions = {
   congestion_penalty_mm: 2,
 };
 
+export const ASSESSMENT_AUTO_LAYOUT_OPTIONS: AutoLayoutOptions = {
+  ...BALANCED_AUTO_LAYOUT_OPTIONS,
+  seed: 424243,
+  component_clearance_mm: 3,
+  trace_width_mm: 0.8,
+  trace_clearance_mm: 0.5,
+};
+
 type AutoLayoutCoreExports = {
   memory: WebAssembly.Memory;
   alloc: (length: number) => number;

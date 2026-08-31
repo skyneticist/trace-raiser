@@ -90,8 +90,8 @@ pub(crate) fn transform_point(point: Point, pose: Pose) -> Point {
     let radians = pose.rotation_degrees.to_radians();
     let (sin, cos) = radians.sin_cos();
     Point {
-        x: pose.x + point.x * cos - point.y * sin,
-        y: pose.y + point.x * sin + point.y * cos,
+        x: pose.x + point.x * cos + point.y * sin,
+        y: pose.y - point.x * sin + point.y * cos,
     }
 }
 
@@ -283,6 +283,20 @@ mod tests {
 
     fn point(x: f64, y: f64) -> Point {
         Point { x, y }
+    }
+
+    #[test]
+    fn positive_board_rotation_matches_kicad_coordinates() {
+        let transformed = transform_point(
+            point(2.0, 0.0),
+            Pose {
+                x: 10.0,
+                y: 20.0,
+                rotation_degrees: 90.0,
+            },
+        );
+        assert!((transformed.x - 10.0).abs() < EPSILON);
+        assert!((transformed.y - 18.0).abs() < EPSILON);
     }
 
     #[test]

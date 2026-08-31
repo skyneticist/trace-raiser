@@ -240,9 +240,20 @@ three DRC checks when KiCad is discoverable; set REQUIRE_KICAD_DRC=1 to make a
 missing CLI a hard failure. KICAD_CLI can select a non-standard executable
 path, and the standard macOS application path is discovered automatically.
 
+The browser assessment fixture adds a larger end-to-end checkpoint without
+turning the routine suite into a broad test matrix: 10 through-hole footprints,
+12 two-terminal nets, three locked edge connectors, one locked series part,
+four movable parts, and two fixed NPTH mounting obstacles. With the checked
+Balanced assessment preset and seed 424243, the shipped WASM produces proposal
+`sha256:430c6a6bdb2b8640027c0e249cf635b30f7d1d97ff53fdd63717d023b97dade6`:
+all 12 nets routed in 50 segments with 38 bends and 278.5524033593761 mm of
+trace. KiCad CLI 10.0.5 strict DRC reported zero violations and zero unconnected
+items on those exact candidate bytes.
+
 This is real KiCad evidence for the exact generated smoke candidate, not
-general approval of arbitrary future output. Every emitted candidate must still
-pass the same strict gate before use.
+general approval of arbitrary future output. The assessment result likewise
+proves only that one deterministic fixture and preset. Every emitted candidate
+must still pass the same strict gate before use.
 
 ## Delivered product slice
 

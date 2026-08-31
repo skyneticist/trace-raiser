@@ -17,6 +17,7 @@ import {
   parseKicad,
 } from "./lib/pcb-core";
 import {
+  ASSESSMENT_AUTO_LAYOUT_OPTIONS,
   BALANCED_AUTO_LAYOUT_OPTIONS,
   generateAutoLayout,
   type AutoLayoutOptions,
@@ -141,11 +142,13 @@ export default function CopperlineStudio() {
 
   const loadAutoLayoutSample = useCallback(async () => {
     try {
-      const response = await fetch("/sample-unrouted.kicad_pcb");
-      if (!response.ok) throw new Error("The AutoLayout sample is unavailable.");
-      await loadKicadText(await response.text(), "sample-unrouted.kicad_pcb");
+      const response = await fetch("/sample-autolayout-assessment.kicad_pcb");
+      if (!response.ok) throw new Error("The AutoLayout assessment board is unavailable.");
+      await loadKicadText(await response.text(), "sample-autolayout-assessment.kicad_pcb");
+      setAutoLayoutQuality("balanced");
+      setAutoLayoutOptions({ ...ASSESSMENT_AUTO_LAYOUT_OPTIONS });
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "The AutoLayout sample could not be loaded.");
+      setStatus(error instanceof Error ? error.message : "The AutoLayout assessment board could not be loaded.");
     }
   }, [loadKicadText]);
 
@@ -270,6 +273,7 @@ export default function CopperlineStudio() {
     ),
   );
   const autoLayoutAvailable = Boolean(board && sourceText && !hasExistingRouting && !routingProposal);
+  const isAssessmentBoard = sourceName === "sample-autolayout-assessment.kicad_pcb";
   const autoLayoutUnavailableReason = !board
     ? "Load an unrouted KiCad board first."
     : !sourceText
@@ -703,7 +707,7 @@ export default function CopperlineStudio() {
                 Reload routed sample <span>→</span>
               </button>
               <button type="button" className="sample-button" onClick={() => void loadAutoLayoutSample()} disabled={busy}>
-                Try unrouted AutoLayout demo <span>→</span>
+                Load 10-part AutoLayout assessment <span>→</span>
               </button>
             </div>
 
@@ -779,7 +783,9 @@ export default function CopperlineStudio() {
                 <>
                   <p className={`auto-layout-eligibility ${autoLayoutAvailable ? "is-ready" : ""}`}>
                     {autoLayoutAvailable
-                      ? "Ready for a deterministic, review-first proposal."
+                      ? isAssessmentBoard
+                        ? "Assessment ready: 10 footprints, 12 nets, and 2 fixed mounting obstacles."
+                        : "Ready for a deterministic, review-first proposal."
                       : autoLayoutUnavailableReason}
                   </p>
                   <div className="quality-picker" role="group" aria-label="AutoLayout search quality">

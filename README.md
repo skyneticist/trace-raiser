@@ -85,7 +85,10 @@ board geometry needed for physical layout. Start in KiCad by assigning
 footprints, drawing one supported board outline, and leaving the copper
 unrouted. Then in Copperline:
 
-1. Open **Source** and load the `.kicad_pcb`, or use the unrouted demo.
+1. Open **Source** and load the `.kicad_pcb`, or load the 10-footprint
+   assessment board. Its 12 two-terminal nets, three fixed edge connectors,
+   fixed series part, and two mounting obstacles provide a more meaningful
+   placement-and-routing review than the minimal internal smoke fixture.
 2. Choose Balanced or Thorough search and, if needed, adjust the clearances,
    trace width, and deterministic replay seed.
 3. Create a proposal and compare **Original** with **Proposed**. The source file
