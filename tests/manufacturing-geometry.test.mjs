@@ -78,6 +78,58 @@ test("uses zero-slope easing for soft tapers", () => {
   assert.ok(quarterRamp > 1.4);
 });
 
+test("deduplicates coincident smooth samples before constructing trace boundaries", () => {
+  const angled = {
+    ...trace(0.6),
+    end: { x: 2 * Math.cos(24 * Math.PI / 180), y: 2 * Math.sin(24 * Math.PI / 180) },
+  };
+  const profile = buildTraceProfile(angled, [], DEFAULT_SETTINGS);
+  for (let index = 1; index < profile.centerline.length; index += 1) {
+    const previous = profile.centerline[index - 1].point;
+    const current = profile.centerline[index].point;
+    assert.ok(Math.hypot(current.x - previous.x, current.y - previous.y) >= 1e-8);
+  }
+
+  const polygon = traceProfilePolygons(profile)[0];
+  const orient = (a, b, c) => (
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+  );
+  const properlyCross = (a, b, c, d) => (
+    orient(a, b, c) * orient(a, b, d) < -1e-12
+    && orient(c, d, a) * orient(c, d, b) < -1e-12
+  );
+  for (let first = 0; first < polygon.length; first += 1) {
+    for (let second = first + 2; second < polygon.length; second += 1) {
+      if (first === 0 && second === polygon.length - 1) continue;
+      assert.equal(properlyCross(
+        polygon[first], polygon[(first + 1) % polygon.length],
+        polygon[second], polygon[(second + 1) % polygon.length],
+      ), false, `boundary edges ${first} and ${second} crossed`);
+    }
+  }
+});
+
+test("samples short smooth tapers finely enough to preserve their analytical width", () => {
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    trace_style: "vintage",
+    trace_width: 4,
+    neckdown_width: 0.8,
+    taper_length: 0.5,
+    teardrop_length: 0.5,
+  };
+  const profile = buildTraceProfile(trace(0.6), [pad(0)], settings);
+  const upper = traceProfilePolygons(profile)[0].slice(0, profile.centerline.length);
+  let maximumError = 0;
+  for (let index = 0; index < upper.length - 1; index += 1) {
+    const midpoint = (upper[index].x + upper[index + 1].x) / 2;
+    const polygonHalfWidth = (upper[index].y + upper[index + 1].y) / 2;
+    const exactHalfWidth = widthAt(profile, midpoint / profile.length, settings.taper_length) / 2;
+    maximumError = Math.max(maximumError, Math.abs(polygonHalfWidth - exactHalfWidth));
+  }
+  assert.ok(maximumError < 0.01, `maximum taper boundary error was ${maximumError} mm`);
+});
+
 test("vintage teardrops widen at the pad shoulder and return smoothly to the route", () => {
   const profile = buildTraceProfile(trace(), [pad(0)], {
     ...DEFAULT_SETTINGS,

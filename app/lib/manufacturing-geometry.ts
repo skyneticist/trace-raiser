@@ -141,6 +141,18 @@ export function buildTraceProfile(
   }
 
   if (settings.trace_style !== "technical") {
+    const rampSteps = Math.max(12, Math.ceil(taperLength / 0.45));
+    const addRampSamples = (from: number, to: number) => {
+      for (let index = 0; index <= rampSteps; index += 1) {
+        const distance = from + (to - from) * index / rampSteps;
+        if (distance >= -EPSILON && distance <= length + EPSILON) {
+          distances.add(clamp(distance, 0, length));
+        }
+      }
+    };
+    if (startExit !== null) addRampSamples(startExit, startExit + taperLength);
+    if (endExit !== null) addRampSamples(length - endExit - taperLength, length - endExit);
+
     const steps = Math.min(192, Math.max(2, Math.ceil(length / 0.45)));
     for (let index = 0; index <= steps; index += 1) distances.add(length * index / steps);
   }
@@ -150,8 +162,10 @@ export function buildTraceProfile(
     startShoulder, endShoulder, style: settings.trace_style,
     teardropLength: settings.teardrop_length, lobes, samples: [], centerline: [],
   };
-  profile.samples = [...distances]
+  const orderedDistances = [...distances]
     .sort((a, b) => a - b)
+    .filter((distance, index, values) => index === 0 || Math.abs(distance - values[index - 1]) >= 1e-8);
+  profile.samples = orderedDistances
     .map((distance) => ({ t: distance / length, width: widthAtDistance(profile, distance, taperLength) }));
   profile.centerline = profile.samples.map((sample) => ({
     ...sample,

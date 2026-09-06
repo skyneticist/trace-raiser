@@ -143,7 +143,7 @@ test("ships the local geometry engine, typeface, and production metadata", async
   assert.doesNotMatch(unroutedSample, /\(segment\b/);
   assert.match(assessmentSample, /^\(kicad_pcb/);
   assert.equal(assessmentSample.match(/\(footprint /g)?.length, 10);
-  assert.equal(assessmentSample.match(/^  \(net (?:[1-9]|1[0-2])\b/gm)?.length, 12);
+  assert.equal(assessmentSample.match(/^ {2}\(net (?:[1-9]|1[0-2])\b/gm)?.length, 12);
   assert.equal(assessmentSample.match(/np_thru_hole/g)?.length, 2);
   assert.doesNotMatch(assessmentSample, /\(segment\b/);
 });
