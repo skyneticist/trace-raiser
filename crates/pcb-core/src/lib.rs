@@ -4507,3 +4507,16 @@ mod tests {
         assert!(error.contains("copper collision between"), "{error}");
     }
 }
+
+fn open_manifold_check(stl: &stl::Stl, thresholds: &[f64]) {
+    let manifold = stl::check_manifold(stl);
+    assert!(manifold.is_closed(), "STL is not a closed manifold");
+    assert!(manifold.is_watertight(), "STL is not watertight");
+    for &threshold in thresholds {
+        assert!(manifold.max_gap() <= threshold, "Max gap exceeds threshold {}", threshold);
+    }
+}
+
+fn assert_closed_manifold(stl: &stl::Stl, thresholds: &[f64]) {
+    open_manifold_check(stl, thresholds);
+}

@@ -1,13 +1,23 @@
 # Copperline Studio
 
-Copperline Studio turns a routed KiCad board into raised-trace geometry for the
-FDM-and-copper-tape prototyping method. Parsing and mesh generation run locally
-in a Rust/WebAssembly core; the browser interface previews the reconstructed
-board and exports slicer-ready 3MF or STL files.
+Copperline Studio turns a KiCad board into raised-trace geometry for the
+FDM-and-copper-tape prototyping method. It can also produce a deterministic,
+review-first placement and single-layer routing proposal for a deliberately
+narrow class of unrouted boards. Parsing, layout, and mesh generation run
+locally in Rust/WebAssembly; the browser previews the reconstructed board and
+exports KiCad candidates, 3MF, or STL files.
 
 ## Current MVP
 
 - Imports routed KiCad 6+ `.kicad_pcb` files.
+- Auto-places front-side through-hole footprints and routes complete proposals
+  on `B.Cu` for an unrouted board with supported courtyards and one simple
+  outline. Existing copper is never overwritten or merged.
+- Keeps an AutoLayout result separate from the source while the user compares
+  original and proposed views, metrics, constraints, and a deterministic replay
+  ID. Only an explicit **Accept + download** action adopts it in the session.
+- Locks printable and project export after acceptance until the downloaded
+  candidate has been checked in KiCad and re-imported.
 - Reconstructs straight and curved back-copper tracks, standard drilled through-hole pads,
   NPTH mounting holes, vias, and simple rectangular, polygonal, or line-chain
   board outlines.
@@ -61,16 +71,39 @@ npm run test:core
 npm run lint
 ```
 
-`npm test` rebuilds `public/pcb_core.wasm` before the production build and
-browser/WASM regression suite so the shipped engine cannot silently lag behind
-the Rust source.
+`npm test` rebuilds both `public/pcb_core.wasm` and
+`public/autolayout_core.wasm` before the production build and browser/WASM
+regression suite so neither shipped engine can silently lag behind Rust source.
 
 The Rust ABI and geometry contract are documented in
 [`crates/pcb-core/README.md`](crates/pcb-core/README.md).
 
-## Why a routed board is required
+## AutoLayout workflow and boundary
 
-A schematic contains connectivity, but it does not contain physical placement,
-footprint, outline, or routing geometry. Automatic schematic-to-board conversion
-would require footprint selection, placement, and autorouting; that is a later,
-separate product problem.
+A schematic contains connectivity, but it does not contain the footprint and
+board geometry needed for physical layout. Start in KiCad by assigning
+footprints, drawing one supported board outline, and leaving the copper
+unrouted. Then in Copperline:
+
+1. Open **Source** and load the `.kicad_pcb`, or load the 10-footprint
+   assessment board. Its 12 two-terminal nets, three fixed edge connectors,
+   fixed series part, and two mounting obstacles provide a more meaningful
+   placement-and-routing review than the minimal internal smoke fixture.
+2. Choose Balanced or Thorough search and, if needed, adjust the clearances,
+   trace width, and deterministic replay seed.
+3. Create a proposal and compare **Original** with **Proposed**. The source file
+   is still unchanged at this point.
+4. Choose **Accept + download** only if the proposal is worth checking.
+5. Open the downloaded candidate in KiCad, run the Design Rules Checker, save,
+   and re-import that checked board before generating printable output.
+
+If the browser suppresses the first download request, reopen **Source** and use
+**Download candidate again**; the accepted candidate remains locked in the
+session until a checked board is re-imported.
+
+The current browser cannot prove that KiCad DRC was run; re-import is the
+explicit trust boundary. AutoLayout fails closed on partial routing and does not
+yet serialize jumpers. SMD, multilayer, RF, impedance-controlled,
+safety-critical, and production designs remain outside the supported scope. See
+the full [AutoLayout foundation](docs/autolayout/FOUNDATION.md) for the engine
+contract and evidence boundary.

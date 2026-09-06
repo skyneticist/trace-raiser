@@ -53,6 +53,9 @@ test("renders source, shaping, diagnostics, and export together on one page", as
     "B.Cu · mirrored · local",
     "Form",
     "Routing",
+    "Load 10-part AutoLayout assessment",
+    "Create routing proposal",
+    "Routing constraints",
     "Trace height",
     "Auto neck-down",
     "Preserve KiCad",
@@ -79,6 +82,13 @@ test("renders source, shaping, diagnostics, and export together on one page", as
   ]) {
     assert.match(html, new RegExp(label));
   }
+  for (const label of [
+    "Accept + download",
+    "Download candidate again",
+    "KiCad remains the authority",
+  ]) {
+    assert.ok(workspaceSource.includes(label), `expected workspace source to include ${label}`);
+  }
   assert.doesNotMatch(html, /workspace-drawer|workflow-rail|drawer-backdrop|drawer-close|<details/i);
   assert.match(workspaceSource, /THEME_PREFERENCE_KEY = "copperline-theme"/);
   assert.match(workspaceSource, /localStorage\.setItem\(THEME_PREFERENCE_KEY, next\)/);
@@ -99,8 +109,9 @@ test("renders source, shaping, diagnostics, and export together on one page", as
 });
 
 test("ships the local geometry engine, typeface, and production metadata", async () => {
-  const [wasm, social, font, fontLicense, packageJson, page, layout, sample] = await Promise.all([
+  const [wasm, autoLayoutWasm, social, font, fontLicense, packageJson, page, layout, sample, unroutedSample, assessmentSample] = await Promise.all([
     stat(new URL("../public/pcb_core.wasm", import.meta.url)),
+    stat(new URL("../public/autolayout_core.wasm", import.meta.url)),
     stat(new URL("../public/og-v2.png", import.meta.url)),
     stat(new URL("../public/fonts/FiraCode-VF.woff2", import.meta.url)),
     readFile(new URL("../public/fonts/FiraCode-LICENSE.txt", import.meta.url), "utf8"),
@@ -108,9 +119,12 @@ test("ships the local geometry engine, typeface, and production metadata", async
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../public/sample-sensor.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-unrouted.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-autolayout-assessment.kicad_pcb", import.meta.url), "utf8"),
   ]);
 
   assert.ok(wasm.size > 100_000, "expected a compiled Rust/WASM engine");
+  assert.ok(autoLayoutWasm.size > 100_000, "expected a compiled AutoLayout WASM engine");
   assert.ok(social.size > 100_000, "expected a bespoke social preview card");
   assert.ok(font.size > 100_000, "expected the self-hosted Fira Code variable font");
   assert.match(fontLicense, /SIL OPEN FONT LICENSE Version 1\.1/i);
@@ -125,16 +139,37 @@ test("ships the local geometry engine, typeface, and production metadata", async
   assert.match(sample, /\(layer "B\.Cu"\)/);
   assert.match(sample, /thru_hole/);
   assert.doesNotMatch(sample, /\spad\s+"[^"]+"\s+smd\s/);
+  assert.match(unroutedSample, /^\(kicad_pcb/);
+  assert.doesNotMatch(unroutedSample, /\(segment\b/);
+  assert.match(assessmentSample, /^\(kicad_pcb/);
+  assert.equal(assessmentSample.match(/\(footprint /g)?.length, 10);
+  assert.equal(assessmentSample.match(/^  \(net (?:[1-9]|1[0-2])\b/gm)?.length, 12);
+  assert.equal(assessmentSample.match(/np_thru_hole/g)?.length, 2);
+  assert.doesNotMatch(assessmentSample, /\(segment\b/);
 });
 
 test("compiled WebAssembly exposes the browser loader ABI", async () => {
-  const bytes = await readFile(new URL("../public/pcb_core.wasm", import.meta.url));
-  const wasmModule = await WebAssembly.compile(bytes);
-  const instance = await WebAssembly.instantiate(wasmModule, {});
+  const [bytes, autoLayoutBytes] = await Promise.all([
+    readFile(new URL("../public/pcb_core.wasm", import.meta.url)),
+    readFile(new URL("../public/autolayout_core.wasm", import.meta.url)),
+  ]);
+  const [wasmModule, autoLayoutModule] = await Promise.all([
+    WebAssembly.compile(bytes),
+    WebAssembly.compile(autoLayoutBytes),
+  ]);
+  const [instance, autoLayoutInstance] = await Promise.all([
+    WebAssembly.instantiate(wasmModule, {}),
+    WebAssembly.instantiate(autoLayoutModule, {}),
+  ]);
 
   assert.equal(typeof instance.exports.alloc, "function");
   assert.equal(typeof instance.exports.dealloc, "function");
   assert.equal(typeof instance.exports.parse_kicad, "function");
   assert.equal(typeof instance.exports.generate_stl, "function");
   assert.ok(instance.exports.memory instanceof WebAssembly.Memory);
+  assert.equal(typeof autoLayoutInstance.exports.alloc, "function");
+  assert.equal(typeof autoLayoutInstance.exports.dealloc, "function");
+  assert.equal(typeof autoLayoutInstance.exports.auto_layout, "function");
+  assert.equal(typeof autoLayoutInstance.exports.last_error, "function");
+  assert.ok(autoLayoutInstance.exports.memory instanceof WebAssembly.Memory);
 });

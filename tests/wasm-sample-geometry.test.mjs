@@ -22,12 +22,20 @@ function callCore(core, method, inputs) {
   });
 
   try {
-    const handle = method === "parse_kicad"
-      ? core.parse_kicad(pointers[0], inputs[0].byteLength)
-      : core.generate_stl(
-          pointers[0], inputs[0].byteLength,
-          pointers[1], inputs[1].byteLength,
-        );
+    let handle;
+    if (method === "parse_kicad") {
+      handle = core.parse_kicad(pointers[0], inputs[0].byteLength);
+    } else if (method === "auto_layout") {
+      handle = core.auto_layout(
+        pointers[0], inputs[0].byteLength,
+        pointers[1], inputs[1].byteLength,
+      );
+    } else {
+      handle = core.generate_stl(
+        pointers[0], inputs[0].byteLength,
+        pointers[1], inputs[1].byteLength,
+      );
+    }
     const { pointer, length } = unpack(handle);
     assert.ok(pointer && length, `${method} returned an empty result`);
     const output = new Uint8Array(core.memory.buffer, pointer, length).slice();
@@ -85,10 +93,12 @@ function pointInTriangle([px, py], [a, b, c]) {
   return !(signs.some((value) => value < -1e-5) && signs.some((value) => value > 1e-5));
 }
 
-test("shipped WASM emits a watertight sample board with every drill open", async () => {
-  const [wasmBytes, source] = await Promise.all([
+test("shipped WASM emits a watertight sample board and routes the assessment board", async () => {
+  const [wasmBytes, autoLayoutBytes, source, assessmentSource] = await Promise.all([
     readFile(new URL("../public/pcb_core.wasm", import.meta.url)),
+    readFile(new URL("../public/autolayout_core.wasm", import.meta.url)),
     readFile(new URL("../public/sample-sensor.kicad_pcb", import.meta.url), "utf8"),
+    readFile(new URL("../public/sample-autolayout-assessment.kicad_pcb", import.meta.url), "utf8"),
   ]);
   const wasmModule = await WebAssembly.compile(wasmBytes);
   const instance = await WebAssembly.instantiate(wasmModule, {});
@@ -180,4 +190,46 @@ test("shipped WASM emits a watertight sample board with every drill open", async
       && pointInTriangle(center, triangle)
     )), `drill axis ${center.join(",")} is open`);
   }
+
+  const autoLayoutModule = await WebAssembly.compile(autoLayoutBytes);
+  const autoLayoutInstance = await WebAssembly.instantiate(autoLayoutModule, {});
+  const autoLayoutCore = autoLayoutInstance.exports;
+  const proposal = JSON.parse(decoder.decode(callCore(autoLayoutCore, "auto_layout", [
+    encoder.encode(assessmentSource),
+    encoder.encode(JSON.stringify({
+      seed: 424243,
+      placement_restarts: 8,
+      placement_refinement_passes: 2,
+      placement_max_grid_points: 100000,
+      placement_grid_mm: 1,
+      component_clearance_mm: 3,
+      edge_clearance_mm: 1,
+      routing_grid_mm: 0.5,
+      trace_width_mm: 0.8,
+      trace_clearance_mm: 0.5,
+      routing_max_search_nodes: 250000,
+      routing_reroute_passes: 6,
+      bend_penalty_mm: 0.25,
+      congestion_penalty_mm: 2,
+    })),
+  ])));
+  assert.equal(proposal.schema_version, 1);
+  assert.equal(proposal.requires_kicad_drc, true);
+  assert.equal(proposal.metrics.component_count, 10);
+  assert.equal(proposal.metrics.moved_component_count, 4);
+  assert.equal(proposal.seed, 424243);
+  assert.equal(proposal.metrics.routed_net_count, 12);
+  assert.equal(proposal.metrics.total_net_count, 12);
+  assert.ok(proposal.metrics.segment_count >= 20);
+  assert.ok(proposal.metrics.bend_count >= 10);
+  assert.ok(proposal.metrics.candidate_evaluations > 100_000);
+  assert.equal(proposal.proposal_id, "sha256:430c6a6bdb2b8640027c0e249cf635b30f7d1d97ff53fdd63717d023b97dade6");
+  assert.doesNotMatch(assessmentSource, /\(segment\b/);
+  assert.match(proposal.candidate_source, /\(segment\b/);
+
+  const candidate = JSON.parse(decoder.decode(callCore(core, "parse_kicad", [
+    encoder.encode(proposal.candidate_source),
+  ])));
+  assert.equal(candidate.stats.traces, proposal.metrics.segment_count);
+  assert.equal(candidate.stats.holes, 26);
 });
