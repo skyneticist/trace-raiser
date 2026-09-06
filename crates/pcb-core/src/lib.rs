@@ -1527,6 +1527,22 @@ fn variable_trace_polygon(
         }
     }
     if style != "technical" {
+        let ramp_steps = ((taper / 0.45).ceil() as usize).max(12);
+        let mut add_ramp_samples = |from: f64, to: f64| {
+            for index in 0..=ramp_steps {
+                let position = from + (to - from) * index as f64 / ramp_steps as f64;
+                if position >= -1e-9 && position <= length + 1e-9 {
+                    positions.push(position.clamp(0.0, length));
+                }
+            }
+        };
+        if let Some(exit) = start_exit {
+            add_ramp_samples(exit, exit + taper);
+        }
+        if let Some(exit) = end_exit {
+            add_ramp_samples(length - exit - taper, length - exit);
+        }
+
         let steps = ((length / 0.45).ceil() as usize).clamp(2, 192);
         positions.extend((0..=steps).map(|index| length * index as f64 / steps as f64));
     }
@@ -4111,6 +4127,34 @@ mod tests {
     }
 
     #[test]
+    fn short_smooth_taper_sampling_tracks_the_analytical_width() {
+        let profile = VariableTraceProfile {
+            trunk: 4.0,
+            neck: 0.8,
+            taper: 0.5,
+            start_exit: Some(2.5),
+            end_exit: None,
+            style: "vintage",
+            teardrop_length: 0.5,
+            start_shoulder: None,
+            end_shoulder: None,
+        };
+        let polygon =
+            variable_trace_polygon(Point { x: 0.0, y: 0.0 }, Point { x: 20.0, y: 0.0 }, profile);
+        let mut maximum_error = 0.0f64;
+        for index in 0..=200 {
+            let x = 2.5 + 0.5 * index as f64 / 200.0;
+            let polygon_width = vertical_span(&polygon, x);
+            let exact_width = variable_trace_width(20.0, profile, x);
+            maximum_error = maximum_error.max((polygon_width - exact_width).abs());
+        }
+        assert!(
+            maximum_error < 0.02,
+            "maximum taper width error was {maximum_error} mm"
+        );
+    }
+
+    #[test]
     fn soft_tapers_and_vintage_pad_shoulders_are_curved_and_manifold() {
         let mut board = plain_board();
         board
@@ -4506,17 +4550,4 @@ mod tests {
         let error = generate_stl(&board, &settings).unwrap_err();
         assert!(error.contains("copper collision between"), "{error}");
     }
-}
-
-fn open_manifold_check(stl: &stl::Stl, thresholds: &[f64]) {
-    let manifold = stl::check_manifold(stl);
-    assert!(manifold.is_closed(), "STL is not a closed manifold");
-    assert!(manifold.is_watertight(), "STL is not watertight");
-    for &threshold in thresholds {
-        assert!(manifold.max_gap() <= threshold, "Max gap exceeds threshold {}", threshold);
-    }
-}
-
-fn assert_closed_manifold(stl: &stl::Stl, thresholds: &[f64]) {
-    open_manifold_check(stl, thresholds);
 }
